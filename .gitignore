@@ -63,6 +63,7 @@ next-env.d.ts
 /data/*
 !/data/.gitkeep
 !/data/README.md
+docker-compose.supabase.yml
 
 # dev tools (local development utilities)
 # Keep the dev toolchain in repo; ignore local-only overrides.
