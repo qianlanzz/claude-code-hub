@@ -5,31 +5,14 @@ import {
   getProviderStatisticsAsync,
   getProviders,
   getProvidersHealthStatus,
-} from "@/actions/providers";
+  type ProviderHealthStatus,
+} from "@/lib/api-client/v1/actions/providers";
+import { getSystemSettings } from "@/lib/api-client/v1/actions/system-config";
 import type { CurrencyCode } from "@/lib/utils/currency";
 import type { ProviderDisplay, ProviderStatisticsMap } from "@/types/provider";
 import type { User } from "@/types/user";
 import { AddProviderDialog } from "./add-provider-dialog";
 import { ProviderManager } from "./provider-manager";
-
-type ProviderHealthStatus = Record<
-  number,
-  {
-    circuitState: "closed" | "open" | "half-open";
-    failureCount: number;
-    lastFailureTime: number | null;
-    circuitOpenUntil: number | null;
-    recoveryMinutes: number | null;
-  }
->;
-
-async function fetchSystemSettings(): Promise<{ currencyDisplay: CurrencyCode }> {
-  const response = await fetch("/api/system-settings");
-  if (!response.ok) {
-    throw new Error("FETCH_SETTINGS_FAILED");
-  }
-  return response.json() as Promise<{ currencyDisplay: CurrencyCode }>;
-}
 
 interface ProviderManagerLoaderProps {
   currentUser?: User;
@@ -78,7 +61,7 @@ function ProviderManagerLoaderContent({
     isFetching: isSettingsFetching,
   } = useQuery<{ currencyDisplay: CurrencyCode }>({
     queryKey: ["system-settings"],
-    queryFn: fetchSystemSettings,
+    queryFn: getSystemSettings,
     refetchOnWindowFocus: false,
     staleTime: 30_000,
   });

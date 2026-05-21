@@ -18,14 +18,6 @@ import {
 import { useTranslations } from "next-intl";
 import { memo, useCallback, useEffect, useState, useTransition } from "react";
 import { toast } from "sonner";
-import {
-  editProvider,
-  getUnmaskedProviderKey,
-  removeProvider,
-  resetProviderCircuit,
-  resetProviderTotalUsage,
-  undoProviderDelete,
-} from "@/actions/providers";
 import { FormErrorBoundary } from "@/components/form-error-boundary";
 import {
   AlertDialog,
@@ -58,6 +50,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
+  editProvider,
+  getUnmaskedProviderKey,
+  removeProvider,
+  resetProviderCircuit,
+  resetProviderTotalUsage,
+  undoProviderDelete,
+} from "@/lib/api-client/v1/actions/providers";
+import {
   PROVIDER_GROUP,
   PROVIDER_LIMITS,
   PROVIDER_TIMEOUT_DEFAULTS,
@@ -70,7 +70,12 @@ import { getContrastTextColor, getGroupColor } from "@/lib/utils/color";
 import type { CurrencyCode } from "@/lib/utils/currency";
 import { formatCurrency } from "@/lib/utils/currency";
 import { normalizeProviderGroupTag, parseProviderGroups } from "@/lib/utils/provider-group";
-import type { ProviderDisplay, ProviderStatistics, ProviderVendor } from "@/types/provider";
+import type {
+  ProviderCircuitHealth,
+  ProviderDisplay,
+  ProviderStatistics,
+  ProviderVendor,
+} from "@/types/provider";
 import type { User } from "@/types/user";
 import { ProviderForm } from "./forms/provider-form";
 import { GroupEditCombobox } from "./group-edit-combobox";
@@ -83,13 +88,7 @@ interface ProviderRichListItemProps {
   provider: ProviderDisplay;
   vendor?: ProviderVendor;
   currentUser?: User;
-  healthStatus?: {
-    circuitState: "closed" | "open" | "half-open";
-    failureCount: number;
-    lastFailureTime: number | null;
-    circuitOpenUntil: number | null;
-    recoveryMinutes: number | null;
-  };
+  healthStatus?: ProviderCircuitHealth;
   /** Endpoint-level circuit breaker info for this provider */
   endpointCircuitInfo?: Array<{
     endpointId: number;

@@ -4,6 +4,7 @@
  * 这里保留协议级兜底默认值；真正执行时会优先使用 presets.ts 里的模板定义。
  */
 
+import { resolveAnthropicAuthHeaders } from "@/app/v1/_lib/headers";
 import { buildProxyUrl } from "@/app/v1/_lib/url";
 import type { ProviderType } from "@/types/provider";
 import type { ClaudeTestBody, CodexTestBody, GeminiTestBody, OpenAITestBody } from "../types";
@@ -44,7 +45,7 @@ export const CLAUDE_TEST_BODY: ClaudeTestBody = {
 };
 
 export const CODEX_TEST_BODY: CodexTestBody = {
-  model: "gpt-5.3-codex",
+  model: "gpt-5.4",
   instructions:
     "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer.",
   input: [
@@ -110,7 +111,7 @@ export const GEMINI_TEST_HEADERS = {
 export const DEFAULT_MODELS: Record<ProviderType, string> = {
   claude: "claude-haiku-4-5-20251001",
   "claude-auth": "claude-haiku-4-5-20251001",
-  codex: "gpt-5.3-codex",
+  codex: "gpt-5.4",
   "openai-compatible": "gpt-4.1-mini",
   gemini: "gemini-2.5-flash",
   "gemini-cli": "gemini-2.5-flash",
@@ -139,47 +140,6 @@ const OPENAI_VERSIONED_FALLBACK_PATHS = [
   ["/v1/chat/completions", "/chat/completions"],
   ["/v1/models", "/models"],
 ] as const;
-
-function looksLikeAnthropicProxy(providerUrl?: string): boolean {
-  if (!providerUrl) {
-    return false;
-  }
-
-  try {
-    const hostname = new URL(providerUrl).hostname.toLowerCase();
-    if (hostname.endsWith("anthropic.com") || hostname.endsWith("claude.ai")) {
-      return false;
-    }
-    // 只匹配常见 relay/proxy 标识，避免把普通业务域名里的 “gpt” 误识别成代理层。
-    return /(?:^|[.-])(proxy|relay|gateway|router|worker|openrouter|api2d|oaipro)(?:[.-]|$)/i.test(
-      hostname
-    );
-  } catch {
-    return false;
-  }
-}
-
-function resolveClaudeHeaders(providerType: ProviderType, apiKey: string, providerUrl?: string) {
-  const headers: Record<string, string> = {
-    "anthropic-version": "2023-06-01",
-    "content-type": "application/json",
-  };
-
-  if (providerType === "claude-auth") {
-    headers.Authorization = `Bearer ${apiKey}`;
-    return headers;
-  }
-
-  if (looksLikeAnthropicProxy(providerUrl)) {
-    headers.Authorization = `Bearer ${apiKey}`;
-    return headers;
-  }
-
-  // 对非代理 Anthropic 直连保留双头，兼容只认 x-api-key 或 Bearer 的 Anthropic-compatible 层。
-  headers["x-api-key"] = apiKey;
-  headers.Authorization = `Bearer ${apiKey}`;
-  return headers;
-}
 
 export function getTestBody(providerType: ProviderType, model?: string): Record<string, unknown> {
   const targetModel = model || DEFAULT_MODELS[providerType];
@@ -217,11 +177,12 @@ export function getTestHeaders(
   switch (providerType) {
     case "claude":
     case "claude-auth":
-      Object.assign(
-        headers,
-        CLAUDE_TEST_HEADERS,
-        resolveClaudeHeaders(providerType, apiKey, providerUrl)
-      );
+      Object.assign(headers, {
+        ...CLAUDE_TEST_HEADERS,
+        ...resolveAnthropicAuthHeaders(apiKey, providerUrl, {
+          forceBearerOnly: providerType === "claude-auth",
+        }),
+      });
       break;
     case "codex":
       Object.assign(headers, {
