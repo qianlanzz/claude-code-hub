@@ -3,6 +3,7 @@ import { ProxyClientGuard } from "./client-guard";
 import type { EndpointPolicy } from "./endpoint-policy";
 import { ProxyMessageService } from "./message-service";
 import { ProxyModelGuard } from "./model-guard";
+import { ProxyOpusTraceGuard } from "./opus-trace-guard";
 import { ProxyProviderRequestFilter } from "./provider-request-filter";
 import { ProxyProviderResolver } from "./provider-selector";
 import { ProxyRateLimitGuard } from "./rate-limit-guard";
@@ -39,6 +40,7 @@ export type GuardStepKey =
   | "rateLimit"
   | "provider"
   | "providerRequestFilter"
+  | "opusTrace"
   | "messageContext";
 
 export interface GuardConfig {
@@ -133,6 +135,12 @@ const Steps: Record<GuardStepKey, GuardStep> = {
       return null;
     },
   },
+  opusTrace: {
+    name: "opusTrace",
+    async execute(session) {
+      return ProxyOpusTraceGuard.ensure(session);
+    },
+  },
   messageContext: {
     name: "messageContext",
     async execute(session) {
@@ -209,6 +217,7 @@ export const CHAT_PIPELINE: GuardConfig = {
     "session",
     "warmup",
     "requestFilter",
+    "opusTrace",
     "rateLimit",
     "provider",
     "providerRequestFilter",

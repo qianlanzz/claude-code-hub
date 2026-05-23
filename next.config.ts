@@ -7,6 +7,13 @@ const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 const nextConfig: NextConfig = {
   output: "standalone",
 
+  // Dockerfile already runs `tsgo -p tsconfig.json --noEmit` before `next build`.
+  // Skipping Next's duplicate type validation keeps production image builds from
+  // spending excessive memory in the standalone tracing phase.
+  typescript: {
+    ignoreBuildErrors: true,
+  },
+
   // 转译 ESM 模块（@lobehub/icons 需要）
   transpilePackages: ["@lobehub/icons"],
 

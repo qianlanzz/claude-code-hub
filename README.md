@@ -371,6 +371,9 @@ cch doctor            # 诊断集群与部署状态
 | `ENABLE_API_KEY_REDIS_CACHE`               | `true`                   | 是否启用 API Key 鉴权 Redis 缓存（需 Redis 可用；异常自动回落到 DB）。       |
 | `API_KEY_AUTH_CACHE_TTL_SECONDS`           | `60`                     | API Key 鉴权缓存 TTL（秒，默认 60，最大 3600）。                              |
 | `SESSION_TTL`                              | `300`                    | Session 缓存时间（秒），影响供应商复用策略。                                 |
+| `OPUS_TRACE_COLLECTION_ENABLED`            | `false`                  | 是否写出 Opus 4.6/4.7 采购格式 trace 文件。                                  |
+| `OPUS_TRACE_ENFORCE_GATE`                  | `false`                  | 是否拒绝非 Opus 4.6/4.7 + adaptive thinking + high/xhigh/max effort 请求。   |
+| `OPUS_TRACE_OUTPUT_DIR`                    | `data/opus-traces`       | trace 输出目录：一个 session 一个文件夹、一次 LLM call 一个 JSON 文件。       |
 | `ENABLE_SECURE_COOKIES`                    | `true`                   | 仅 HTTPS 场景能设置 Secure Cookie；HTTP 访问（非 localhost）需改为 `false`。 |
 | `ENABLE_CIRCUIT_BREAKER_ON_NETWORK_ERRORS` | `false`                  | 是否将网络错误计入熔断器；开启后能更激进地阻断异常线路。                     |
 | `APP_PORT`                                 | `23000`                  | 生产端口，可被容器或进程管理器覆盖。                                         |

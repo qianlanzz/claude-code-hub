@@ -46,6 +46,26 @@ import { isClientAbortError, isTransportError } from "./errors";
 import type { ProxySession } from "./session";
 import { consumeDeferredStreamingFinalization } from "./stream-finalization";
 
+function emitOpusTraceRecord(
+  session: ProxySession,
+  params: {
+    responseHeaders: Headers;
+    responseText: string;
+    statusCode: number;
+    errorMessage?: string;
+  }
+): void {
+  void import("@/lib/opus-trace/writer")
+    .then(({ writeOpusTraceRecord }) => writeOpusTraceRecord(session, params))
+    .catch((error) => {
+      logger.warn("[OpusTrace] Failed to write trace record", {
+        error: error instanceof Error ? error.message : String(error),
+        sessionId: session.sessionId,
+        requestSequence: session.requestSequence,
+      });
+    });
+}
+
 /**
  * Idempotent helper to release the agent pool reference count attached to a session.
  * Prevents double-release by clearing the callback after first invocation.
@@ -1016,6 +1036,12 @@ export class ProxyResponseHandler {
               isStreaming: false,
               errorMessage: errorMessageForFinalize,
             });
+            emitOpusTraceRecord(session, {
+              responseHeaders: response.headers,
+              responseText,
+              statusCode,
+              errorMessage: errorMessageForFinalize,
+            });
           } catch (error) {
             if (session.sessionId && session.shouldPersistSessionDebugArtifacts()) {
               await discardBeforeResponseBodySnapshot(session);
@@ -1434,6 +1460,11 @@ export class ProxyResponseHandler {
           statusCode,
           durationMs: Date.now() - session.startTime,
           isStreaming: false,
+        });
+        emitOpusTraceRecord(session, {
+          responseHeaders: response.headers,
+          responseText,
+          statusCode,
         });
       } catch (error) {
         if (session.sessionId && session.shouldPersistSessionDebugArtifacts()) {
@@ -1920,6 +1951,12 @@ export class ProxyResponseHandler {
               statusCode: finalized.effectiveStatusCode,
               durationMs: duration,
               isStreaming: true,
+              errorMessage: finalized.errorMessage ?? undefined,
+            });
+            emitOpusTraceRecord(session, {
+              responseHeaders: response.headers,
+              responseText: allContent,
+              statusCode: finalized.effectiveStatusCode,
               errorMessage: finalized.errorMessage ?? undefined,
             });
           } catch (error) {
@@ -2526,6 +2563,12 @@ export class ProxyResponseHandler {
           durationMs: duration,
           isStreaming: true,
           sseEventCount: chunks.length,
+          errorMessage: streamErrorMessage ?? undefined,
+        });
+        emitOpusTraceRecord(session, {
+          responseHeaders: response.headers,
+          responseText: allContent,
+          statusCode: effectiveStatusCode,
           errorMessage: streamErrorMessage ?? undefined,
         });
       };

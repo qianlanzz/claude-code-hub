@@ -10,7 +10,10 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV CI=true
-RUN --mount=type=cache,target=/app/.next/cache bun run build
+RUN --mount=type=cache,target=/app/.next/cache \
+    node node_modules/.bin/tsgo -p tsconfig.json --noEmit && \
+    node node_modules/next/dist/bin/next build && \
+    (node scripts/copy-version-to-standalone.cjs || bun scripts/copy-version-to-standalone.cjs)
 
 FROM node:20-slim AS runner
 WORKDIR /app
