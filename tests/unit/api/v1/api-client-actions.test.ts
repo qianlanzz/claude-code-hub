@@ -1,17 +1,19 @@
 import { Buffer } from "node:buffer";
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { DASHBOARD_COMPAT_HEADER } from "@/lib/api/v1/_shared/constants";
 import { ApiError } from "@/lib/api-client/v1/errors";
 
 const getMock = vi.hoisted(() => vi.fn());
 const patchMock = vi.hoisted(() => vi.fn());
 const postMock = vi.hoisted(() => vi.fn());
+const deleteMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/api-client/v1/client", () => ({
   apiClient: {
     get: getMock,
     patch: patchMock,
     post: postMock,
+    delete: deleteMock,
   },
 }));
 
@@ -33,10 +35,18 @@ const providerEndpoints = await vi.importActual<
 const usageLogs = await vi.importActual<typeof import("@/lib/api-client/v1/actions/usage-logs")>(
   "@/lib/api-client/v1/actions/usage-logs"
 );
+const keys = await vi.importActual<typeof import("@/lib/api-client/v1/actions/keys")>(
+  "@/lib/api-client/v1/actions/keys"
+);
 
 describe("v1 action compatibility client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  // Always restore globals, even if a stubbed-fetch test throws mid-assertion.
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   test("preserves provider edit undo metadata from response headers", async () => {
@@ -372,5 +382,228 @@ describe("v1 action compatibility client", () => {
     expect(result).not.toHaveProperty("ok");
     expect(result).not.toHaveProperty("data");
     expect(result[1]?.circuitState).toBe("open");
+  });
+
+  test("wraps provider group counts in ActionResult for the dashboard consumer", async () => {
+    // 后端 listProviderGroups 经 actionJson() 解包，直接返回裸数组；
+    // provider-group-select.tsx 却按 `{ ok, data }` 消费。若 api-client 不再包一层，
+    // `res.ok` 永远 undefined，每次展开用户编辑面板都会误报 "获取供应商分组统计失败"。
+    const groupCounts = [
+      { group: "default", providerCount: 2 },
+      { group: "prod", providerCount: 1 },
+    ];
+    getMock.mockResolvedValue(groupCounts);
+
+    const result = await providers.getProviderGroupsWithCount();
+
+    expect(getMock).toHaveBeenCalledWith("/api/v1/providers/groups?include=count", {
+      headers: { [DASHBOARD_COMPAT_HEADER]: "1" },
+    });
+    expect(result).toEqual({ ok: true, data: groupCounts });
+  });
+
+  test("maps a failed provider group counts request to a failed ActionResult", async () => {
+    getMock.mockRejectedValue(
+      new ApiError({
+        status: 403,
+        errorCode: "auth.forbidden",
+        detail: "Admin access is required.",
+      })
+    );
+
+    const result = await providers.getProviderGroupsWithCount();
+
+    // errorCode must arrive pre-mapped to an errors-namespace key so forms can
+    // translate it directly (issue #1259: raw "auth.forbidden" rendered as the
+    // literal fallback string "errors.auth.forbidden").
+    expect(result).toEqual({
+      ok: false,
+      error: "Admin access is required.",
+      errorCode: "PERMISSION_DENIED",
+      errorParams: undefined,
+    });
+  });
+
+  test("addKey hard-fails on 403 instead of silently retargeting to the self endpoint", async () => {
+    // U03: the old 403 fallback could turn "create a key for user X" into
+    // "create a key for myself" when the session lost admin rights mid-flight.
+    postMock.mockRejectedValueOnce(
+      new ApiError({
+        status: 403,
+        errorCode: "auth.forbidden",
+        detail: "Admin access is required.",
+      })
+    );
+
+    const result = await keys.addKey({ userId: 2, name: "self-key", providerGroup: "default" });
+
+    expect(postMock).toHaveBeenCalledTimes(1);
+    expect(postMock).toHaveBeenCalledWith(
+      "/api/v1/users/2/keys",
+      { name: "self-key", providerGroup: "default" },
+      undefined
+    );
+    expect(result).toMatchObject({ ok: false, errorCode: "PERMISSION_DENIED" });
+  });
+
+  test("addOwnKey posts directly to the self key-creation endpoint", async () => {
+    postMock.mockResolvedValueOnce({ id: 77, generatedKey: "sk-new", name: "self-key" });
+
+    const result = await keys.addOwnKey({ name: "self-key", providerGroup: "default" });
+
+    expect(postMock).toHaveBeenCalledTimes(1);
+    expect(postMock).toHaveBeenCalledWith(
+      "/api/v1/users:self/keys",
+      { name: "self-key", providerGroup: "default" },
+      undefined
+    );
+    expect(result).toEqual({
+      ok: true,
+      data: { id: 77, generatedKey: "sk-new", name: "self-key" },
+    });
+  });
+
+  test("does not retry key creation for non-authorization failures", async () => {
+    postMock.mockRejectedValue(
+      new ApiError({
+        status: 400,
+        errorCode: "DUPLICATE_NAME",
+        detail: "Key name already exists.",
+      })
+    );
+
+    const result = await keys.addKey({ userId: 2, name: "self-key" });
+
+    expect(postMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      ok: false,
+      error: "Key name already exists.",
+      errorCode: "DUPLICATE_NAME",
+      errorParams: undefined,
+    });
+  });
+
+  test("preserves business delete codes through toVoidActionResult (removeKey)", async () => {
+    // The #1266 contract: CANNOT_DELETE_LAST_KEY must survive the void wrapper
+    // unchanged (not collapsed to a generic code) so the toast shows the reason.
+    deleteMock.mockRejectedValueOnce(
+      new ApiError({
+        status: 400,
+        errorCode: "CANNOT_DELETE_LAST_KEY",
+        detail: "Bad request",
+      })
+    );
+
+    const result = await keys.removeKey(7);
+
+    expect(deleteMock).toHaveBeenCalledWith("/api/v1/keys/7");
+    expect(result).toEqual({
+      ok: false,
+      error: "Bad request",
+      errorCode: "CANNOT_DELETE_LAST_KEY",
+      errorParams: undefined,
+    });
+  });
+
+  test("maps key.action_failed through toVoidActionResult to OPERATION_FAILED", async () => {
+    deleteMock.mockRejectedValueOnce(
+      new ApiError({ status: 400, errorCode: "key.action_failed", detail: "Bad request" })
+    );
+
+    const result = await keys.removeKey(7);
+
+    expect(result).toMatchObject({ ok: false, errorCode: "OPERATION_FAILED" });
+  });
+
+  test("addOwnKey surfaces PERMISSION_DENIED for read-only sessions", async () => {
+    // Drop any persistent implementation a prior test left on postMock so the
+    // Once-rejection below is the only behavior in play.
+    postMock.mockReset();
+    postMock.mockRejectedValueOnce(
+      new ApiError({
+        status: 403,
+        errorCode: "auth.forbidden",
+        detail: "Read-only sessions cannot create keys.",
+      })
+    );
+
+    const result = await keys.addOwnKey({ name: "self-key" });
+
+    expect(postMock).toHaveBeenCalledTimes(1);
+    expect(postMock).toHaveBeenCalledWith(
+      "/api/v1/users:self/keys",
+      { name: "self-key" },
+      undefined
+    );
+    expect(result).toMatchObject({ ok: false, errorCode: "PERMISSION_DENIED" });
+  });
+
+  test("maps resource action_failed codes to translatable error codes", async () => {
+    getMock.mockRejectedValue(
+      new ApiError({
+        status: 400,
+        errorCode: "key.action_failed",
+        detail: "Bad request",
+      })
+    );
+
+    const result = await keys.getKeys(2);
+
+    expect(result).toEqual({
+      ok: false,
+      error: "Bad request",
+      errorCode: "OPERATION_FAILED",
+      errorParams: undefined,
+    });
+  });
+
+  test("wraps model suggestions in ActionResult for the autocomplete consumer", async () => {
+    // 与分组统计同源：use-model-suggestions.ts 检查 `res.ok && res.data`，
+    // 裸数组会让自动补全静默失效（不报错但永远拿不到建议模型）。
+    const suggestions = ["claude-3-opus", "claude-3-sonnet"];
+    getMock.mockResolvedValue(suggestions);
+
+    const result = await providers.getModelSuggestionsByProviderGroup("default");
+
+    expect(getMock).toHaveBeenCalledWith(
+      "/api/v1/providers/model-suggestions?providerGroup=default",
+      { headers: { [DASHBOARD_COMPAT_HEADER]: "1" } }
+    );
+    expect(result).toEqual({ ok: true, data: suggestions });
+  });
+
+  test("downloadUsageLogsExport returns the response body as a Blob", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(new Blob(["PKxlsx-bytes"]), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "Content-Disposition": 'attachment; filename="usage-logs-job-9.xlsx"',
+          },
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await usageLogs.downloadUsageLogsExport("job-9");
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/usage-logs/exports/job-9/download", {
+      credentials: "include",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.data.blob).toBeInstanceOf(Blob);
+    expect(await result.data.blob.text()).toBe("PKxlsx-bytes");
+  });
+
+  test("downloadUsageLogsExport surfaces a non-2xx download as an error result", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response("nope", { status: 404, statusText: "Not Found" })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await usageLogs.downloadUsageLogsExport("missing");
+
+    expect(result.ok).toBe(false);
   });
 });

@@ -97,6 +97,8 @@
       "exportError": "匯出失敗",
       "exportPreparing": "正在準備匯出...",
       "exportProgress": "已匯出 {current} / {total} 筆",
+      "exportAsCsv": "匯出為 CSV",
+      "exportAsXlsx": "匯出為 XLSX（含彙總表）",
       "quickFilters": {
         "today": "今天",
         "thisWeek": "本週",
@@ -320,6 +322,19 @@
         "providerMultiplier": "供應商倍率",
         "groupMultiplier": "分組倍率",
         "baseTotal": "基礎合計",
+        "hedgeRacing": "供應商競速",
+        "hedgeWinner": "競速贏家",
+        "hedgeLoser": "競速輸家",
+        "hedgeLosersTotal": "競速輸家合計",
+        "hedgeMergedCount": "合併 {count} 次",
+        "hedgeWinnerShort": "贏家",
+        "hedgeLoserShort": "輸家",
+        "hedgeColAttempt": "嘗試",
+        "hedgeColCacheRead": "快取R",
+        "hedgeColCacheWrite": "快取W",
+        "hedgeColCost": "費用",
+        "hedgeTokenTotal": "Token 合計",
+        "hedgeReclaimedNotDelivered": "已取回回應，未交付用戶端",
         "unitPricePer1M": "@ {price} / 1M",
         "unit": {
           "tokens": "tokens"
@@ -359,7 +374,8 @@
       },
       "effort": {
         "label": "Effort",
-        "overridden": "已被供應商覆寫"
+        "overridden": "已被供應商覆寫",
+        "tooltip": "用戶端在請求體中宣告的思考強度（output_config.effort），按原值顯示，代理不會重新命名或轉換等級。"
       },
       "logicTrace": {
         "title": "決策鏈",
@@ -436,6 +452,19 @@
       "providerMultiplier": "供應商倍率",
       "groupMultiplier": "分組倍率",
       "baseTotal": "基礎合計",
+      "hedgeRacing": "供應商競速",
+      "hedgeWinner": "競速贏家",
+      "hedgeLoser": "競速輸家",
+      "hedgeLosersTotal": "競速輸家合計",
+      "hedgeMergedCount": "合併 {count} 次",
+      "hedgeWinnerShort": "贏家",
+      "hedgeLoserShort": "輸家",
+      "hedgeColAttempt": "嘗試",
+      "hedgeColCacheRead": "快取R",
+      "hedgeColCacheWrite": "快取W",
+      "hedgeColCost": "費用",
+      "hedgeTokenTotal": "Token 合計",
+      "hedgeReclaimedNotDelivered": "已取回回應，未交付用戶端",
       "unit": {
         "tokens": "tokens"
       }
@@ -927,9 +956,9 @@
     "addKey": "新增金鑰",
     "keyCreatedDialog": {
       "title": "金鑰建立成功",
-      "description": "您的 API 金鑰已成功建立。請務必複製並妥善保存，此金鑰僅顯示一次。",
+      "description": "您的 API 金鑰已成功建立。請複製並妥善保存，避免外洩；後續可在金鑰列表中重新檢視完整金鑰。",
       "apiKeyLabel": "API 金鑰",
-      "warningText": "請在關閉前複製並儲存，關閉後將無法再次檢視此金鑰",
+      "warningText": "請妥善保管此金鑰，避免外洩。如有需要，可隨時在金鑰列表中重新檢視完整金鑰",
       "httpWarningText": "偵測到 HTTP 存取，瀏覽器限制無法使用複製功能。請點擊眼睛圖示顯示金鑰後手動複製。",
       "copyTooltip": "複製到剪貼簿",
       "showTooltip": "顯示完整金鑰",
@@ -1041,7 +1070,7 @@
     "successDescription": "您的 API 金鑰已成功建立。",
     "generatedKey": {
       "label": "產生的金鑰",
-      "hint": "您可以在金鑰列表中管理此金鑰（啟用/停用、設定限額等），但完整金鑰僅顯示一次，請立即複製並妥善保存"
+      "hint": "您可以在金鑰列表中管理此金鑰（啟用/停用、設定限額等），並可隨時重新檢視完整金鑰。請妥善保管，避免外洩"
     },
     "errors": {
       "userIdMissing": "使用者 ID 不存在",
@@ -1754,7 +1783,7 @@
       "successTitle": "建立成功",
       "successDescription": "使用者和金鑰已成功建立",
       "generatedKey": "產生的金鑰",
-      "keyHint": "您可以在使用者管理頁面管理此金鑰（啟用/停用、設定限額等），但完整金鑰僅顯示一次，請立即複製並妥善保存",
+      "keyHint": "您可以在使用者管理頁面管理此金鑰（啟用/停用、設定限額等），並可隨時重新檢視完整金鑰。請妥善保管，避免外洩",
       "keysSection": "金鑰",
       "addKey": "新增金鑰",
       "removeKey": "刪除金鑰",

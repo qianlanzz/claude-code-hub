@@ -22,6 +22,11 @@ Claude Code Hub combines Next.js 15, Hono, PostgreSQL, and Redis to deliver a Cl
 
 ---
 
+> [!IMPORTANT]
+> **This project is currently under active refactoring**
+>
+> Claude Code Hub Plus, the refactored version of Claude Code Hub, is expected to be open-sourced under the AGPL license in Q3. Claude Code Hub Plus is dedicated to building a high-performance, stable, commercial-grade LLM gateway, offering comprehensive commercial features such as format conversion, privacy filtering, a model marketplace, and top-up billing, while significantly improving the theoretical performance of the forwarding core. During development of the refactored version, progress and community support for the Node.js version may be delayed — thank you for your understanding.
+
 <table>
 <tr>
 <td width="200">
@@ -81,21 +86,6 @@ AIGoCode offers a special bonus for CCH users — register via this link and rec
 <table>
 <tr>
 <td width="200">
-<a href="https://www.aicodemirror.com/register?invitecode=ZRQVL9">
-<img src="public/readme/aicodemirror.jpg" alt="AICodeMirror Logo" width="180"/>
-</a>
-</td>
-<td>
-<b>💎 Special Offer</b>: Thanks to <a href="https://www.aicodemirror.com/register?invitecode=ZRQVL9">AICodeMirror</a> for sponsoring this project! AICodeMirror provides official high-stability relay services for Claude Code / Codex / Gemini CLI, with enterprise-grade concurrency, fast invoicing, and 24/7 dedicated technical support.<br/>
-Claude Code / Codex / Gemini official channels at 38% / 6% / 9% of original price, with extra discounts on top-ups!<br/>
-For claude-code-hub users, AICodeMirror offers special benefits: register via this link to enjoy 20% off your first top-up, and enterprise customers can get up to 25% off! → <a href="https://www.aicodemirror.com/register?invitecode=ZRQVL9">Visit Now</a>
-</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="200">
 <a href="https://pateway.ai/?ch=1ycdoum&aff=T8FV5H42">
 <img src="public/readme/pateway.png" alt="PatewayAI Logo" width="180"/>
 </a>
@@ -124,7 +114,7 @@ Register now via <a href="https://pateway.ai/?ch=1ycdoum&aff=T8FV5H42">this link
 ### Requirements
 
 - Docker and Docker Compose (latest version recommended)
-- Optional (for local development): Node.js ≥ 20, Bun ≥ 1.3
+- Optional (for local development): Node.js ≥ 22.15 (inbound zstd request-body decompression uses native `node:zlib` zstd), Bun ≥ 1.3
 
 ### 🚀 One-Click Deployment Script (✨ Recommended - Fully Automated)
 

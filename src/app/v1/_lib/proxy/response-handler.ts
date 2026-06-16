@@ -35,11 +35,13 @@ import {
   inferUpstreamErrorStatusCodeFromText,
 } from "@/lib/utils/upstream-error-detection";
 import {
+  addMessageRequestHedgeLoserCost,
   updateMessageRequestCostWithBreakdown,
   updateMessageRequestDetails,
   updateMessageRequestDuration,
+  updateMessageRequestWinnerCost,
 } from "@/repository/message";
-import type { StoredCostBreakdown } from "@/types/cost-breakdown";
+import type { HedgeLoserBilling, StoredCostBreakdown } from "@/types/cost-breakdown";
 import type { Provider } from "@/types/provider";
 import type { SessionUsageUpdate } from "@/types/session";
 import type { LongContextPricingSpecialSetting } from "@/types/special-settings";
@@ -49,7 +51,12 @@ import { extractActualResponseModelForProvider } from "./actual-response-model";
 import { bindClientAbortListener } from "./client-abort-listener";
 import { isClientAbortError, isTransportError } from "./errors";
 import type { ProxySession } from "./session";
-import { consumeDeferredStreamingFinalization } from "./stream-finalization";
+import {
+  consumeDeferredStreamingFinalization,
+  peekDeferredStreamingFinalization,
+} from "./stream-finalization";
+
+const CLIENT_ABORT_DRAIN_MAX_MS = 60_000;
 
 /**
  * Idempotent helper to release the agent pool reference count attached to a session.
@@ -183,8 +190,11 @@ function ensurePricingResolutionSpecialSetting(
   });
 }
 
-function getRequestedCodexServiceTier(session: ProxySession): string | null {
-  if (session.provider?.providerType !== "codex") {
+function getRequestedCodexServiceTier(
+  session: ProxySession,
+  provider?: Provider | null
+): string | null {
+  if ((provider ?? session.provider)?.providerType !== "codex") {
     return null;
   }
 
@@ -243,13 +253,21 @@ type CodexPriorityBillingDecision = {
 
 async function resolveCodexPriorityBillingDecision(
   session: ProxySession,
-  actualServiceTier: string | null
+  actualServiceTier: string | null,
+  options?: {
+    provider?: Provider | null;
+    requestedServiceTier?: string | null;
+  }
 ): Promise<CodexPriorityBillingDecision | null> {
-  if (session.provider?.providerType !== "codex") {
+  const provider = options?.provider ?? session.provider;
+  if (provider?.providerType !== "codex") {
     return null;
   }
 
-  const requestedServiceTier = getRequestedCodexServiceTier(session);
+  const requestedServiceTier =
+    options?.requestedServiceTier !== undefined
+      ? options.requestedServiceTier
+      : getRequestedCodexServiceTier(session, provider);
   let billingSourcePreference: Awaited<ReturnType<ProxySession["getCodexPriorityBillingSource"]>> =
     "requested";
 
@@ -397,6 +415,28 @@ function hasPositiveBillableTokens(usage: UsageMetrics | null): boolean {
   return tokens > 0;
 }
 
+const FINISH_REASON_MARKER = /"finish_reason"\s*:\s*"[a-z_]+"/;
+const GEMINI_FINISH_REASON_MARKER = /"finishReason"\s*:\s*"[A-Z_]+"/;
+
+/**
+ * 判断流式响应文本中是否存在“与格式匹配的终止完成标记”，用以区分
+ * “上游已完整结束（仅客户端先断开）”与“流被客户端中断而截断”。
+ *
+ * 仅 usage>0 不足以证明完成：Anthropic 在首个 `message_start` 即带 usage、
+ * Gemini 在中间事件即带 usageMetadata，截断流同样会出现正向 token。
+ */
+function hasStreamCompletionMarker(text: string): boolean {
+  if (
+    text.includes("response.completed") || // OpenAI Responses / Codex
+    text.includes("message_stop") || // Anthropic Messages
+    text.includes("[DONE]") // OpenAI Chat Completions
+  ) {
+    return true;
+  }
+  // OpenAI chat / Gemini：非空 finish reason 标记最终块。
+  return FINISH_REASON_MARKER.test(text) || GEMINI_FINISH_REASON_MARKER.test(text);
+}
+
 export async function resolveBillableUsageMetricsForCost(
   session: ProxySession,
   provider: Provider | null,
@@ -501,6 +541,21 @@ type FinalizeDeferredStreamingResult = {
    * 该字段用于保证 DB 的 providerId 与 providerChain/熔断归因一致。
    */
   providerIdForPersistence: number | null;
+  /** 本次流是否为 hedge 竞速赢家（commitWinner 标记）。 */
+  isHedgeWinner: boolean;
+  /**
+   * 本次请求是否开启了竞速输家计费。开启时赢家费用以“从 0 累加”方式写入，
+   * 以便与异步累加的输家费用共存而互不覆盖。
+   */
+  billHedgeLosers: boolean;
+  /**
+   * clientAbortCompleteSuccess 门控解析出的 usage（U11：drain 路径避免对同一份
+   * allContent 二次解析）。providerType 与调用方不一致时调用方需自行重新解析。
+   */
+  clientAbortGateUsage?: {
+    usageMetrics: UsageMetrics | null;
+    providerType: Provider["providerType"] | undefined;
+  };
 };
 
 /**
@@ -536,6 +591,8 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   };
 
   const providerIdForPersistence = meta?.providerId ?? provider?.id ?? null;
+  const isHedgeWinner = meta?.isHedgeWinner === true;
+  const billHedgeLosers = meta?.billHedgeLosers === true;
 
   // 仅在“上游 HTTP=200 且流自然结束”时做“假 200”检测：
   // - 非 200：HTTP 已经表明失败（无需额外启发式）
@@ -546,6 +603,37 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   const detected = shouldDetectFake200
     ? detectUpstreamErrorFromSseOrJsonText(allContent)
     : ({ isError: false } as const);
+  let clientAbortGateUsage: FinalizeDeferredStreamingResult["clientAbortGateUsage"];
+  const clientAbortCompleteSuccess = (() => {
+    if (
+      streamEndedNormally ||
+      !clientAborted ||
+      upstreamStatusCode < 200 ||
+      upstreamStatusCode >= 300
+    ) {
+      return false;
+    }
+
+    const abortDetected = detectUpstreamErrorFromSseOrJsonText(allContent);
+    if (abortDetected.isError) {
+      return false;
+    }
+
+    // U01: positive usage alone is NOT proof the stream completed — Anthropic
+    // emits usage in the FIRST `message_start` event and Gemini in intermediate
+    // `usageMetadata`, so a stream truncated by the client abort still shows
+    // tokens. Only reclassify as a success when a format-appropriate terminal
+    // completion marker is present, proving the upstream finished before the
+    // client stopped reading. Otherwise keep the pre-PR safe default (499,
+    // unbilled).
+    if (!hasStreamCompletionMarker(allContent)) {
+      return false;
+    }
+
+    const { usageMetrics } = parseUsageFromResponseText(allContent, provider?.providerType);
+    clientAbortGateUsage = { usageMetrics, providerType: provider?.providerType };
+    return hasPositiveBillableTokens(usageMetrics);
+  })();
 
   // “内部结算用”的状态码（不会改变客户端实际 HTTP 状态码）。
   // - 假 200：优先映射为“推断得到的 4xx/5xx”（未命中则回退 502），确保内部统计/熔断/会话绑定把它当作失败。
@@ -564,6 +652,9 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
       effectiveStatusCode = 502;
     }
     errorMessage = detected.detail ? `${detected.code}: ${detected.detail}` : detected.code;
+  } else if (clientAbortCompleteSuccess) {
+    effectiveStatusCode = upstreamStatusCode;
+    errorMessage = null;
   } else if (!streamEndedNormally) {
     effectiveStatusCode = clientAborted ? 499 : 502;
     errorMessage = clientAborted ? "CLIENT_ABORTED" : (abortReason ?? "STREAM_ABORTED");
@@ -582,7 +673,7 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   }
 
   const shouldClearSessionBindingOnFailure =
-    !streamEndedNormally ||
+    (!streamEndedNormally && !clientAbortCompleteSuccess) ||
     detected.isError ||
     (upstreamStatusCode >= 400 && errorMessage !== null);
 
@@ -594,7 +685,14 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   // - 只返回“内部状态码 + 错误原因”，由调用方写入统计；
   // - 不在这里更新熔断/绑定（meta 缺失意味着 Forwarder 没有启用延迟结算；provider 缺失意味着无法归因）。
   if (!meta || !provider) {
-    return { effectiveStatusCode, errorMessage, providerIdForPersistence };
+    return {
+      effectiveStatusCode,
+      errorMessage,
+      providerIdForPersistence,
+      isHedgeWinner,
+      billHedgeLosers,
+      clientAbortGateUsage,
+    };
   }
 
   // meta 由 Forwarder 在“拿到 upstream Response 的那一刻”记录，代表真正产生本次流的 provider。
@@ -639,7 +737,7 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   // 同时，为了让故障转移/熔断能正确工作：
   // - 客户端主动中断：不计入熔断器（这通常不是供应商问题）
   // - 非客户端中断：计入 provider/endpoint 熔断失败（与 timeout 路径保持一致）
-  if (!streamEndedNormally) {
+  if (!streamEndedNormally && !clientAbortCompleteSuccess) {
     await clearSessionBinding();
 
     if (!clientAborted && session.getEndpointPolicy().allowCircuitBreakerAccounting) {
@@ -670,7 +768,14 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
       errorMessage: errorMessage ?? undefined,
     });
 
-    return { effectiveStatusCode, errorMessage, providerIdForPersistence };
+    return {
+      effectiveStatusCode,
+      errorMessage,
+      providerIdForPersistence,
+      isHedgeWinner,
+      billHedgeLosers,
+      clientAbortGateUsage,
+    };
   }
 
   if (detected.isError) {
@@ -724,7 +829,14 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
       errorMessage: detected.detail ? `${detected.code}: ${detected.detail}` : detected.code,
     });
 
-    return { effectiveStatusCode, errorMessage, providerIdForPersistence };
+    return {
+      effectiveStatusCode,
+      errorMessage,
+      providerIdForPersistence,
+      isHedgeWinner,
+      billHedgeLosers,
+      clientAbortGateUsage,
+    };
   }
 
   // ========== 非200状态码处理（流自然结束但HTTP状态码表示错误）==========
@@ -770,7 +882,14 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
       errorMessage: errorMessage,
     });
 
-    return { effectiveStatusCode, errorMessage, providerIdForPersistence };
+    return {
+      effectiveStatusCode,
+      errorMessage,
+      providerIdForPersistence,
+      isHedgeWinner,
+      billHedgeLosers,
+      clientAbortGateUsage,
+    };
   }
 
   // ========== 真正成功（SSE 完整结束且未命中错误判定）==========
@@ -866,7 +985,14 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
     statusCode: meta.upstreamStatusCode,
   });
 
-  return { effectiveStatusCode, errorMessage, providerIdForPersistence };
+  return {
+    effectiveStatusCode,
+    errorMessage,
+    providerIdForPersistence,
+    isHedgeWinner,
+    billHedgeLosers,
+    clientAbortGateUsage,
+  };
 }
 
 export class ProxyResponseHandler {
@@ -1297,28 +1423,22 @@ export class ProxyResponseHandler {
         }
 
         if (billableUsageMetrics && messageContext) {
+          const billing = sessionBillingInputs(session, provider, priorityServiceTierApplied);
           const costUpdateResult = await updateRequestCostFromUsage(
             messageContext.id,
             session,
             billableUsageMetrics,
-            provider,
-            provider.costMultiplier,
-            session.getContext1mApplied(),
-            priorityServiceTierApplied,
-            session.getGroupCostMultiplier()
+            billing
           );
           if (costUpdateResult.longContextPricingApplied) {
             ensureLongContextPricingAudit(session, costUpdateResult.longContextPricing);
           }
 
           // 追踪消费到 Redis（用于限流）
-          await trackCostToRedis(
-            session,
-            billableUsageMetrics,
-            priorityServiceTierApplied,
-            costUpdateResult.resolvedPricing,
-            costUpdateResult.longContextPricing
-          );
+          await trackCostToRedis(session, billableUsageMetrics, billing, {
+            resolvedPricing: costUpdateResult.resolvedPricing,
+            longContextPricing: costUpdateResult.longContextPricing,
+          });
         }
 
         // Calculate cost for session tracking (with multiplier) and Langfuse (raw)
@@ -2182,7 +2302,7 @@ export class ProxyResponseHandler {
       }
     }
 
-    // ⭐ 使用 TransformStream 包装流，以便在 idle timeout 时能关闭客户端流
+    // 使用 TransformStream 包装流，以便在 idle timeout 时能关闭客户端流
     // 这解决了 tee() 后 internalStream abort 不影响 clientStream 的问题
     let streamController: TransformStreamDefaultController<Uint8Array> | null = null;
     const controllableStream = processedStream.pipeThrough(
@@ -2202,28 +2322,115 @@ export class ProxyResponseHandler {
     // 使用 AsyncTaskManager 管理后台处理任务
     const taskId = `stream-${messageContext?.id || `unknown-${Date.now()}`}`;
     const abortController = new AbortController();
+    const idleTimeoutMs =
+      provider.streamingIdleTimeoutMs > 0 ? provider.streamingIdleTimeoutMs : Infinity;
+    const clientAbortDrainTimeoutMs = CLIENT_ABORT_DRAIN_MAX_MS;
 
-    // ⭐ 提升 idleTimeoutId 到外部作用域，以便客户端断开时能清除
+    // 提升 idleTimeoutId 到外部作用域，以便客户端断开时能清除
     let idleTimeoutId: NodeJS.Timeout | null = null;
+    let clientAbortDrainTimeoutId: NodeJS.Timeout | null = null;
+    const chunks: string[] = [];
+    const clearClientAbortDrainTimer = () => {
+      if (clientAbortDrainTimeoutId) {
+        clearTimeout(clientAbortDrainTimeoutId);
+        clientAbortDrainTimeoutId = null;
+      }
+    };
+    const clearIdleTimer = () => {
+      if (idleTimeoutId) {
+        clearTimeout(idleTimeoutId);
+        idleTimeoutId = null;
+      }
+    };
+    const startIdleTimer = () => {
+      if (idleTimeoutMs === Infinity) return; // 禁用时跳过
+      clearIdleTimer(); // 清除旧的
+      idleTimeoutId = setTimeout(() => {
+        logger.warn("ResponseHandler: Streaming idle timeout triggered", {
+          taskId,
+          providerId: provider.id,
+          idleTimeoutMs,
+          chunksCollected: chunks.length,
+        });
+
+        // 1. 关闭客户端流（让客户端收到连接关闭通知，避免悬挂）
+        try {
+          if (streamController) {
+            streamController.error(new Error("Streaming idle timeout"));
+            logger.debug("ResponseHandler: Client stream closed due to idle timeout", {
+              taskId,
+              providerId: provider.id,
+            });
+          }
+        } catch (e) {
+          logger.warn("ResponseHandler: Failed to close client stream", {
+            taskId,
+            providerId: provider.id,
+            error: e,
+          });
+        }
+
+        // 2. 终止上游连接（避免资源泄漏）
+        try {
+          const sessionWithController = session as typeof session & {
+            responseController?: AbortController;
+          };
+          if (sessionWithController.responseController) {
+            sessionWithController.responseController.abort(new Error("streaming_idle"));
+            logger.debug("ResponseHandler: Upstream connection aborted due to idle timeout", {
+              taskId,
+              providerId: provider.id,
+            });
+          }
+        } catch (e) {
+          logger.warn("ResponseHandler: Failed to abort upstream connection", {
+            taskId,
+            providerId: provider.id,
+            error: e,
+          });
+        }
+
+        // 3. 终止后台读取任务
+        abortController.abort(new Error("streaming_idle"));
+      }, idleTimeoutMs);
+    };
     const cleanupClientAbortListener = bindClientAbortListener(session.clientAbortSignal, () => {
       logger.debug("ResponseHandler: Client disconnected, cleaning up", {
         taskId,
         providerId: provider.id,
         messageId: messageContext.id,
       });
-
-      // 客户端断开时清除 idle timeout，避免任务已取消后仍误触发。
-      if (idleTimeoutId) {
-        clearTimeout(idleTimeoutId);
-        idleTimeoutId = null;
-        logger.debug("ResponseHandler: Idle timeout cleared due to client disconnect", {
+      // Do not cancel internal accounting on pure client disconnect. If the
+      // upstream stream has already completed, the tee'd internal branch can
+      // still drain buffered final usage and record the request as successful.
+      // Idle/response timeout paths still abort via abortController.
+      clearClientAbortDrainTimer();
+      if (!idleTimeoutId) {
+        startIdleTimer();
+      }
+      clientAbortDrainTimeoutId = setTimeout(() => {
+        logger.info("ResponseHandler: Client abort drain window exceeded", {
           taskId,
           providerId: provider.id,
+          messageId: messageContext.id,
+          clientAbortDrainTimeoutMs,
         });
-      }
 
-      AsyncTaskManager.cancel(taskId);
-      abortController.abort();
+        try {
+          const sessionWithController = session as typeof session & {
+            responseController?: AbortController;
+          };
+          sessionWithController.responseController?.abort(new Error("client_abort_drain_timeout"));
+        } catch (e) {
+          logger.warn("ResponseHandler: Failed to abort upstream after client drain timeout", {
+            taskId,
+            providerId: provider.id,
+            error: e,
+          });
+        }
+
+        abortController.abort(new Error("client_abort_drain_timeout"));
+      }, clientAbortDrainTimeoutMs);
     });
 
     const processingPromise = (async () => {
@@ -2232,74 +2439,13 @@ export class ProxyResponseHandler {
       // 注意：即使 STORE_SESSION_RESPONSE_BODY=false（不写入 Redis），这里也会在内存中累积完整流内容：
       // - 用于解析 usage/cost 与内部结算（例如“假 200”检测）
       // 因此该开关仅影响“是否持久化”，不用于控制流式内存占用。
-      const chunks: string[] = [];
       let usageForCost: UsageMetrics | null = null;
-      let isFirstChunk = true; // ⭐ 标记是否为第一块数据
+      let isFirstChunk = true; // 标记是否为第一块数据
 
-      // ⭐ 静默期 Watchdog：监控流式请求中途卡住（无新数据推送）
-      const idleTimeoutMs =
-        provider.streamingIdleTimeoutMs > 0 ? provider.streamingIdleTimeoutMs : Infinity;
-      const startIdleTimer = () => {
-        if (idleTimeoutMs === Infinity) return; // 禁用时跳过
-        clearIdleTimer(); // 清除旧的
-        idleTimeoutId = setTimeout(() => {
-          logger.warn("ResponseHandler: Streaming idle timeout triggered", {
-            taskId,
-            providerId: provider.id,
-            idleTimeoutMs,
-            chunksCollected: chunks.length,
-          });
-
-          // ⭐ 1. 关闭客户端流（让客户端收到连接关闭通知，避免悬挂）
-          try {
-            if (streamController) {
-              streamController.error(new Error("Streaming idle timeout"));
-              logger.debug("ResponseHandler: Client stream closed due to idle timeout", {
-                taskId,
-                providerId: provider.id,
-              });
-            }
-          } catch (e) {
-            logger.warn("ResponseHandler: Failed to close client stream", {
-              taskId,
-              providerId: provider.id,
-              error: e,
-            });
-          }
-
-          // ⭐ 2. 终止上游连接（避免资源泄漏）
-          try {
-            const sessionWithController = session as typeof session & {
-              responseController?: AbortController;
-            };
-            if (sessionWithController.responseController) {
-              sessionWithController.responseController.abort(new Error("streaming_idle"));
-              logger.debug("ResponseHandler: Upstream connection aborted due to idle timeout", {
-                taskId,
-                providerId: provider.id,
-              });
-            }
-          } catch (e) {
-            logger.warn("ResponseHandler: Failed to abort upstream connection", {
-              taskId,
-              providerId: provider.id,
-              error: e,
-            });
-          }
-
-          // ⭐ 3. 终止后台读取任务
-          abortController.abort(new Error("streaming_idle"));
-        }, idleTimeoutMs);
-      };
-      const clearIdleTimer = () => {
-        if (idleTimeoutId) {
-          clearTimeout(idleTimeoutId);
-          idleTimeoutId = null;
-        }
-      };
-
-      // ⭐ 不在首次读取前启动 idle timer（避免与首字节超时职责重叠）
-      // idle timer 仅在首块数据到达后启动，用于检测流中途静默
+      // 不在首次读取前启动 idle timer（避免与首字节超时职责重叠）
+      // idle timer 仅在首块数据到达后启动，用于检测流中途静默。
+      // 客户端断开后例外：后台 drain 也会启动 idle timer，避免 pre-body
+      // 静默一直等到 60s drain 总上限。
 
       const flushAndJoin = (): string => {
         const flushed = decoder.decode();
@@ -2365,7 +2511,11 @@ export class ProxyResponseHandler {
         const tracker = ProxyStatusTracker.getInstance();
         tracker.endRequest(messageContext.user.id, messageContext.id);
 
-        const usageResult = parseUsageFromResponseText(allContent, provider.providerType);
+        // U11：门控已在 finalize 内解析过同一份 allContent，类型一致时直接复用
+        const usageResult =
+          finalized.clientAbortGateUsage?.providerType === provider.providerType
+            ? { usageMetrics: finalized.clientAbortGateUsage.usageMetrics }
+            : parseUsageFromResponseText(allContent, provider.providerType);
         usageForCost = usageResult.usageMetrics;
 
         const actualServiceTier = parseServiceTierFromResponseText(allContent);
@@ -2423,28 +2573,28 @@ export class ProxyResponseHandler {
           allContent
         );
 
+        const billing = sessionBillingInputs(session, provider, priorityServiceTierApplied);
         const costUpdateResult = await updateRequestCostFromUsage(
           messageContext.id,
           session,
           billableUsageForCost,
-          provider,
-          provider.costMultiplier,
-          session.getContext1mApplied(),
-          priorityServiceTierApplied,
-          session.getGroupCostMultiplier()
+          billing,
+          // Any hedge-path winner with loser billing on uses the loser-sum-aware write.
+          // Gate on billHedgeLosers (not the racy isHedgeWinner/launchedProviderCount):
+          // an alternative can still be mid-launch when the initial provider commits, so
+          // isHedgeWinner may read false even though a loser will bill — using it would
+          // let the winner's replacement clobber that loser's additive write.
+          finalized.billHedgeLosers
         );
         if (costUpdateResult.longContextPricingApplied) {
           ensureLongContextPricingAudit(session, costUpdateResult.longContextPricing);
         }
 
         // 追踪消费到 Redis（用于限流）
-        await trackCostToRedis(
-          session,
-          billableUsageForCost,
-          priorityServiceTierApplied,
-          costUpdateResult.resolvedPricing,
-          costUpdateResult.longContextPricing
-        );
+        await trackCostToRedis(session, billableUsageForCost, billing, {
+          resolvedPricing: costUpdateResult.resolvedPricing,
+          longContextPricing: costUpdateResult.longContextPricing,
+        });
 
         // Calculate cost for session tracking (with multiplier) and Langfuse (raw)
         let costUsdStr: string | undefined;
@@ -2605,7 +2755,7 @@ export class ProxyResponseHandler {
         let streamEndedNormally = false;
         while (true) {
           // 检查取消信号
-          if (session.clientAbortSignal?.aborted || abortController.signal.aborted) {
+          if (abortController.signal.aborted) {
             logger.info("ResponseHandler: Stream processing cancelled", {
               taskId,
               providerId: provider.id,
@@ -2624,7 +2774,7 @@ export class ProxyResponseHandler {
             const chunkSize = value.length;
             chunks.push(decoder.decode(value, { stream: true }));
 
-            // ⭐ 每次收到数据后重置静默期计时器（首次收到数据时启动）
+            // 每次收到数据后重置静默期计时器（首次收到数据时启动）
             startIdleTimer();
             logger.trace("ResponseHandler: Idle timer reset (data received)", {
               taskId,
@@ -2634,7 +2784,7 @@ export class ProxyResponseHandler {
               idleTimeoutMs: idleTimeoutMs === Infinity ? "disabled" : idleTimeoutMs,
             });
 
-            // ⭐ 流式：读到第一块数据后立即清除响应超时定时器
+            // 流式：读到第一块数据后立即清除响应超时定时器
             if (isFirstChunk) {
               session.recordTtfb();
               isFirstChunk = false;
@@ -2653,7 +2803,7 @@ export class ProxyResponseHandler {
           }
         }
 
-        // ⭐ 流式读取完成：清除静默期计时器
+        // 流式读取完成：清除静默期计时器
         clearIdleTimer();
         const allContent = flushAndJoin();
         const clientAborted = session.clientAbortSignal?.aborted ?? false;
@@ -2746,7 +2896,12 @@ export class ProxyResponseHandler {
             // 结算并消费 deferred meta，确保 provider chain/熔断归因完整
             try {
               const allContent = flushAndJoin();
-              await finalizeStream(allContent, false, false, "STREAM_IDLE_TIMEOUT");
+              await finalizeStream(
+                allContent,
+                false,
+                clientAborted,
+                clientAborted ? "CLIENT_ABORTED" : "STREAM_IDLE_TIMEOUT"
+              );
             } catch (finalizeError) {
               logger.error("ResponseHandler: Failed to finalize idle-timeout stream", {
                 taskId,
@@ -2883,7 +3038,8 @@ export class ProxyResponseHandler {
       } finally {
         // 确保资源释放
         cleanupClientAbortListener();
-        clearIdleTimer(); // ⭐ 清除静默期计时器（防止泄漏）
+        clearClientAbortDrainTimer();
+        clearIdleTimer(); // 清除静默期计时器（防止泄漏）
         try {
           reader.releaseLock();
         } catch (releaseError) {
@@ -3514,17 +3670,25 @@ async function updateRequestCostFromUsage(
   messageId: number,
   session: ProxySession,
   usage: UsageMetrics | null,
-  provider: Provider | null,
-  costMultiplier: number = 1.0,
-  context1mApplied: boolean = false,
-  priorityServiceTierApplied: boolean = false,
-  groupCostMultiplier: number = 1.0
+  billing: BillingComputeInputs,
+  // When true the winner cost is written via a direct, idempotent, loser-sum-aware
+  // replacement (cost_usd = winnerCost + SUM(hedge_losers[].costUsd)) so it coexists
+  // with losers' concurrent additive writes without clobbering or double-counting.
+  // Used for hedge-path winners when billHedgeLosers is on.
+  winnerLoserAware: boolean = false
 ): Promise<{
   costUsd: string | null;
   resolvedPricing: Awaited<ReturnType<ProxySession["getResolvedPricingByBillingSource"]>> | null;
   longContextPricing: ResolvedLongContextPricing | null;
   longContextPricingApplied: boolean;
 }> {
+  const {
+    provider,
+    costMultiplier,
+    context1mApplied,
+    priorityServiceTierApplied,
+    groupCostMultiplier,
+  } = billing;
   if (!usage) {
     logger.warn("[CostCalculation] No usage data, skipping cost update", {
       messageId,
@@ -3635,7 +3799,11 @@ async function updateRequestCostFromUsage(
     });
 
     if (cost.gt(0)) {
-      await updateMessageRequestCostWithBreakdown(messageId, cost, storedBreakdown);
+      if (winnerLoserAware) {
+        await updateMessageRequestWinnerCost(messageId, cost, storedBreakdown);
+      } else {
+        await updateMessageRequestCostWithBreakdown(messageId, cost, storedBreakdown);
+      }
       return {
         costUsd: cost.toString(),
         resolvedPricing,
@@ -3675,6 +3843,194 @@ async function updateRequestCostFromUsage(
 }
 
 /**
+ * Bill a hedge (provider racing) loser whose upstream response was drained in the
+ * background by the forwarder.
+ *
+ * Mirrors the winner billing pipeline (parse usage -> normalize -> billable gate ->
+ * resolve pricing -> compute cost) but using the LOSER's provider/session for pricing
+ * and multipliers, then accumulates the cost onto the ORIGINAL request row via the
+ * additive write-back (cost_usd += delta, hedge_losers ||= [entry]).
+ *
+ * Best-effort: any failure is logged and swallowed so a loser-billing problem never
+ * affects the winner's response. Returns the billed cost string, or null if nothing
+ * was billed (no usage / non-billable / zero cost).
+ */
+export async function finalizeHedgeLoserBilling(params: {
+  messageRequestId: number;
+  /** Loser's session — used for pricing/multiplier resolution and Redis cost tracking. */
+  loserSession: ProxySession;
+  provider: Provider;
+  /** Hedge attempt sequence number, for the audit entry. */
+  attemptNumber: number;
+  /** Upstream HTTP status of the loser's response. */
+  upstreamStatusCode: number;
+  /** The drained loser response body (SSE or JSON). */
+  allContent: string;
+  /**
+   * Whether the loser stream was read to its natural end. When false (drain hit the
+   * timeout / size cap / a network abort), we only bill if real token usage was parsed
+   * — never the input_cost_per_request {0,0} sentinel, which would over-charge a phantom
+   * per-request fee for a truncated stream.
+   */
+  drainComplete: boolean;
+  /**
+   * Billing context captured BEFORE the shared session could be polluted by
+   * syncWinningAttemptSession (only set for the INITIAL provider's losing attempt, whose
+   * session is overwritten with the winner's model). Shadow-session losers leave this
+   * undefined and read their own (un-polluted) session.
+   */
+  billingContext?: {
+    originalModel: string | null;
+    redirectedModel: string | null;
+    requestedServiceTier: string | null;
+    context1mApplied: boolean;
+    groupCostMultiplier: number;
+  };
+}): Promise<string | null> {
+  const {
+    messageRequestId,
+    loserSession,
+    provider,
+    attemptNumber,
+    upstreamStatusCode,
+    allContent,
+    drainComplete,
+    billingContext,
+  } = params;
+
+  try {
+    if (isNonBillingUsageEndpoint(loserSession)) {
+      return null;
+    }
+
+    const { usageMetrics } = parseUsageFromResponseText(allContent, provider.providerType);
+    let usageForCost = usageMetrics;
+    if (usageForCost) {
+      usageForCost = normalizeUsageWithSwap(
+        usageForCost,
+        loserSession,
+        provider.swapCacheTtlBilling
+      );
+    }
+
+    // Truncated drain (timeout / cap / abort) with no parsed usage: do NOT fall through to
+    // the per-request-fee sentinel — that would over-bill a phantom fee for an incomplete stream.
+    if (!drainComplete && !usageForCost) {
+      return null;
+    }
+
+    // Same billable gate as the winner: status-code / fake-200 / non-billing checks.
+    const billableUsage = await resolveBillableUsageMetricsForCost(
+      loserSession,
+      provider,
+      usageForCost,
+      upstreamStatusCode,
+      allContent
+    );
+    if (!billableUsage) {
+      return null;
+    }
+
+    const resolvedPricing = await loserSession.getResolvedPricingByBillingSource(
+      provider,
+      billingContext
+        ? {
+            originalModel: billingContext.originalModel,
+            redirectedModel: billingContext.redirectedModel,
+          }
+        : undefined
+    );
+    if (!resolvedPricing?.priceData || !hasValidPriceData(resolvedPricing.priceData)) {
+      return null;
+    }
+
+    const actualServiceTier = parseServiceTierFromResponseText(allContent);
+    const priorityServiceTierApplied =
+      (
+        await resolveCodexPriorityBillingDecision(loserSession, actualServiceTier, {
+          provider,
+          ...(billingContext ? { requestedServiceTier: billingContext.requestedServiceTier } : {}),
+        })
+      )?.effectivePriority ?? false;
+    // Mirror the winner: a Codex loser with a large prompt must trigger the 1M context tier,
+    // else it under-bills. Only mutate for shadow-session losers (no snapshot) — the initial
+    // loser uses its pre-pollution snapshot and must not mutate the shared/original session.
+    if (!billingContext) {
+      maybeSetCodexContext1m(loserSession, provider, billableUsage.input_tokens);
+    }
+    const context1mApplied = billingContext?.context1mApplied ?? loserSession.getContext1mApplied();
+    const costMultiplier = provider.costMultiplier;
+    const groupCostMultiplier =
+      billingContext?.groupCostMultiplier ?? loserSession.getGroupCostMultiplier();
+
+    const longContextPricing =
+      matchLongContextPricing(billableUsage, resolvedPricing.priceData)?.pricing ?? null;
+    const cost = calculateRequestCost(
+      billableUsage,
+      resolvedPricing.priceData,
+      buildCostCalculationOptions(
+        costMultiplier,
+        context1mApplied,
+        priorityServiceTierApplied,
+        longContextPricing,
+        groupCostMultiplier
+      )
+    );
+
+    if (!cost.gt(0)) {
+      return null;
+    }
+
+    const loserEntry: HedgeLoserBilling = {
+      providerId: provider.id,
+      providerName: provider.name,
+      attemptNumber,
+      costUsd: cost.toString(),
+      inputTokens: billableUsage.input_tokens,
+      outputTokens: billableUsage.output_tokens,
+      cacheCreationInputTokens: billableUsage.cache_creation_input_tokens,
+      cacheReadInputTokens: billableUsage.cache_read_input_tokens,
+    };
+
+    await addMessageRequestHedgeLoserCost(messageRequestId, cost, loserEntry);
+
+    // Track the loser cost into the same Redis spend counters the winner uses, so the
+    // key/user/provider rate limits account for it (DB and limit enforcement stay in sync).
+    await trackCostToRedis(
+      loserSession,
+      billableUsage,
+      {
+        provider,
+        costMultiplier,
+        context1mApplied,
+        priorityServiceTierApplied,
+        groupCostMultiplier,
+      },
+      { resolvedPricing, longContextPricing }
+    );
+
+    logger.info("[HedgeLoserBilling] Billed hedge loser", {
+      messageRequestId,
+      providerId: provider.id,
+      providerName: provider.name,
+      attemptNumber,
+      costUsd: cost.toString(),
+    });
+
+    return cost.toString();
+  } catch (error) {
+    logger.warn("[HedgeLoserBilling] Failed to bill hedge loser, skipping", {
+      messageRequestId,
+      providerId: provider.id,
+      providerName: provider.name,
+      attemptNumber,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+/**
  * 统一的请求统计处理方法
  * 用于消除 Gemini 透传、普通非流式、普通流式之间的重复统计逻辑
  *
@@ -3704,6 +4060,11 @@ export async function finalizeRequestStats(
   const resolvedIsStream = isStreaming ?? isSSEText(responseText);
 
   const providerIdForPersistence = providerIdOverride ?? session.provider?.id;
+  // Hedge-path (e.g. Gemini passthrough) winners reach finalization here instead of via
+  // finalizeStream. Peek the deferred meta (without consuming it — commitWinner already did
+  // the binding/chain) so the winner cost write uses the loser-sum-aware mode and does not
+  // clobber concurrently-billed loser increments.
+  const winnerLoserAware = peekDeferredStreamingFinalization(session)?.billHedgeLosers === true;
   const { usageMetrics } = parseUsageFromResponseText(responseText, provider.providerType);
   const actualServiceTier = parseServiceTierFromResponseText(responseText);
   const codexPriorityBillingDecision = await resolveCodexPriorityBillingDecision(
@@ -3725,15 +4086,13 @@ export async function finalizeRequestStats(
     let perRequestCostUsd: string | undefined;
 
     if (billablePerRequestUsage) {
+      const billing = sessionBillingInputs(session, provider, priorityServiceTierApplied);
       const costUpdateResult = await updateRequestCostFromUsage(
         messageContext.id,
         session,
         billablePerRequestUsage,
-        provider,
-        provider.costMultiplier,
-        session.getContext1mApplied(),
-        priorityServiceTierApplied,
-        session.getGroupCostMultiplier()
+        billing,
+        winnerLoserAware
       );
       if (costUpdateResult.resolvedPricing) {
         ensurePricingResolutionSpecialSetting(session, costUpdateResult.resolvedPricing);
@@ -3742,13 +4101,10 @@ export async function finalizeRequestStats(
         ensureLongContextPricingAudit(session, costUpdateResult.longContextPricing);
       }
 
-      await trackCostToRedis(
-        session,
-        billablePerRequestUsage,
-        priorityServiceTierApplied,
-        costUpdateResult.resolvedPricing,
-        costUpdateResult.longContextPricing
-      );
+      await trackCostToRedis(session, billablePerRequestUsage, billing, {
+        resolvedPricing: costUpdateResult.resolvedPricing,
+        longContextPricing: costUpdateResult.longContextPricing,
+      });
       perRequestCostUsd = costUpdateResult.costUsd ?? undefined;
     }
 
@@ -3802,28 +4158,23 @@ export async function finalizeRequestStats(
     maybeSetCodexContext1m(session, provider, billableNormalizedUsage.input_tokens);
   }
 
+  const billing = sessionBillingInputs(session, provider, priorityServiceTierApplied);
   const costUpdateResult = await updateRequestCostFromUsage(
     messageContext.id,
     session,
     normalizedUsage,
-    provider,
-    provider.costMultiplier,
-    session.getContext1mApplied(),
-    priorityServiceTierApplied,
-    session.getGroupCostMultiplier()
+    billing,
+    winnerLoserAware
   );
   if (costUpdateResult.longContextPricingApplied) {
     ensureLongContextPricingAudit(session, costUpdateResult.longContextPricing);
   }
 
   // 5. 追踪消费到 Redis（用于限流）
-  await trackCostToRedis(
-    session,
-    normalizedUsage,
-    priorityServiceTierApplied,
-    costUpdateResult.resolvedPricing,
-    costUpdateResult.longContextPricing
-  );
+  await trackCostToRedis(session, normalizedUsage, billing, {
+    resolvedPricing: costUpdateResult.resolvedPricing,
+    longContextPricing: costUpdateResult.longContextPricing,
+  });
 
   // 6. 更新 session usage
   if (session.sessionId) {
@@ -3911,21 +4262,48 @@ export async function finalizeRequestStats(
 /**
  * 追踪消费到 Redis（用于限流）
  */
+/**
+ * 计费五元组（U19）：一次构造，贯穿 updateRequestCostFromUsage / trackCostToRedis /
+ * buildCostCalculationOptions。正常路径用 sessionBillingInputs 从会话即时取值；
+ * hedge loser 路径用 commitWinner 之前的快照构造，避免被赢家提交污染。
+ */
+type BillingComputeInputs = {
+  provider: Provider | null;
+  costMultiplier: number;
+  context1mApplied: boolean;
+  priorityServiceTierApplied: boolean;
+  groupCostMultiplier: number;
+};
+
+function sessionBillingInputs(
+  session: ProxySession,
+  provider: Provider,
+  priorityServiceTierApplied: boolean
+): BillingComputeInputs {
+  return {
+    provider,
+    costMultiplier: provider.costMultiplier,
+    context1mApplied: session.getContext1mApplied(),
+    priorityServiceTierApplied,
+    groupCostMultiplier: session.getGroupCostMultiplier(),
+  };
+}
+
 async function trackCostToRedis(
   session: ProxySession,
   usage: UsageMetrics | null,
-  priorityServiceTierApplied: boolean = false,
-  resolvedPricingOverride?: Awaited<
-    ReturnType<ProxySession["getResolvedPricingByBillingSource"]>
-  > | null,
-  longContextPricingOverride?: ResolvedLongContextPricing | null
+  billing: BillingComputeInputs,
+  pricingOverrides?: {
+    resolvedPricing?: Awaited<ReturnType<ProxySession["getResolvedPricingByBillingSource"]>> | null;
+    longContextPricing?: ResolvedLongContextPricing | null;
+  }
 ): Promise<void> {
   if (!usage || !session.sessionId) return;
   if (isNonBillingUsageEndpoint(session)) return;
 
   try {
     const messageContext = session.messageContext;
-    const provider = session.provider;
+    const { provider, priorityServiceTierApplied } = billing;
     const key = session.authState?.key;
     const user = session.authState?.user;
 
@@ -3935,26 +4313,26 @@ async function trackCostToRedis(
     if (!modelName) return;
 
     const resolvedPricing =
-      resolvedPricingOverride === undefined
+      pricingOverrides?.resolvedPricing === undefined
         ? await session.getResolvedPricingByBillingSource(provider)
-        : resolvedPricingOverride;
+        : pricingOverrides.resolvedPricing;
     if (!resolvedPricing) return;
 
     ensurePricingResolutionSpecialSetting(session, resolvedPricing);
     const longContextPricing =
-      longContextPricingOverride === undefined
+      pricingOverrides?.longContextPricing === undefined
         ? (matchLongContextPricing(usage, resolvedPricing.priceData)?.pricing ?? null)
-        : longContextPricingOverride;
+        : pricingOverrides.longContextPricing;
 
     const cost = calculateRequestCost(
       usage,
       resolvedPricing.priceData,
       buildCostCalculationOptions(
-        provider.costMultiplier,
-        session.getContext1mApplied(),
+        billing.costMultiplier,
+        billing.context1mApplied,
         priorityServiceTierApplied,
         longContextPricing,
-        session.getGroupCostMultiplier()
+        billing.groupCostMultiplier
       )
     );
     if (cost.lte(0)) return;

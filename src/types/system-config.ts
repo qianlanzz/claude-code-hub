@@ -43,6 +43,11 @@ export interface SystemSettings {
   //         fake-200 上游错误识别仍生效，保证假成功响应不会被错误计费。
   billNonSuccessfulRequests: boolean;
 
+  // 供应商竞速（streaming hedge）输家计费（默认开启）
+  // 开启后：竞速落败的供应商不再被直接掐断，而是后台拿回其上游响应并按 token 用量计费，
+  //         其费用异步累加进该请求的总花费（与上游对多个供应商分别计费保持一致）。
+  billHedgeLosers: boolean;
+
   // 系统时区配置 (IANA timezone identifier)
   // 用于统一后端时间边界计算和前端日期/时间显示
   // null 表示使用环境变量 TZ 或默认 UTC
@@ -85,6 +90,11 @@ export interface SystemSettings {
   // thinking budget 整流器（默认开启）
   // 目标：当 Anthropic 类型供应商出现 budget_tokens < 1024 错误时，自动整流并重试一次
   enableThinkingBudgetRectifier: boolean;
+
+  // thinking effort 冲突整流器（默认开启）
+  // 目标：当 Anthropic 兼容供应商（DeepSeek/MiMo 等）因 thinking 关闭 + reasoning_effort
+  // 同时存在返回 400 错误时，自动剥离 effort 字段并对同供应商重试一次
+  enableThinkingEffortConflictRectifier: boolean;
 
   // billing header 整流器（默认开启）
   // 目标：主动移除 Claude Code 客户端注入到 system 提示中的 x-anthropic-billing-header 文本块，
@@ -152,6 +162,9 @@ export interface UpdateSystemSettingsInput {
   // 非成功请求按 token 用量计费（可选）
   billNonSuccessfulRequests?: boolean;
 
+  // 供应商竞速输家计费（可选）
+  billHedgeLosers?: boolean;
+
   // 系统时区配置（可选）
   timezone?: string | null;
 
@@ -187,6 +200,9 @@ export interface UpdateSystemSettingsInput {
 
   // thinking budget 整流器（可选）
   enableThinkingBudgetRectifier?: boolean;
+
+  // thinking effort 冲突整流器（可选）
+  enableThinkingEffortConflictRectifier?: boolean;
 
   // billing header 整流器（可选）
   enableBillingHeaderRectifier?: boolean;

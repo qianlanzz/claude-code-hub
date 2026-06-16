@@ -46,6 +46,7 @@ import type {
   ClaudeMetadataUserIdInjectionSpecialSetting,
   SpecialSetting,
 } from "@/types/special-settings";
+import type { SystemSettings } from "@/types/system-config";
 
 import { GeminiAuth } from "../gemini/auth";
 import { GEMINI_PROTOCOL } from "../gemini/protocol";
@@ -89,15 +90,26 @@ import {
   validateOpenAIImageRequest,
 } from "./openai-image-compat";
 import { ProxyProviderResolver } from "./provider-selector";
+import { finalizeHedgeLoserBilling } from "./response-handler";
 import type { ProxySession } from "./session";
 import { setDeferredStreamingFinalization } from "./stream-finalization";
 import {
   detectThinkingBudgetRectifierTrigger,
   rectifyThinkingBudget,
+  type ThinkingBudgetRectifierResult,
+  type ThinkingBudgetRectifierTrigger,
 } from "./thinking-budget-rectifier";
+import {
+  detectThinkingEffortConflictRectifierTrigger,
+  rectifyThinkingEffortConflict,
+  type ThinkingEffortConflictRectifierResult,
+  type ThinkingEffortConflictRectifierTrigger,
+} from "./thinking-effort-conflict-rectifier";
 import {
   detectThinkingSignatureRectifierTrigger,
   rectifyAnthropicRequestMessage,
+  type ThinkingSignatureRectifierResult,
+  type ThinkingSignatureRectifierTrigger,
 } from "./thinking-signature-rectifier";
 
 /** Default User-Agent for Codex CLI requests when none is provided */
@@ -198,12 +210,40 @@ type StreamingHedgeAttempt = {
   response: Response | null;
   releaseAgent: (() => void) | null;
   agentReleased: boolean;
+  /** When true, this losing attempt is kept alive, drained, and billed instead of cancelled. */
+  billAsLoser: boolean;
+  /** Idempotency guard: ensures loser drain/billing runs at most once per attempt. */
+  loserBillingStarted: boolean;
+  /**
+   * First chunk already pulled from this attempt's reader before it lost the race.
+   * Preserved so loser billing can prepend it when draining (Claude's message_start
+   * usage lives in the first chunk).
+   */
+  firstChunk: Uint8Array | null;
+  /**
+   * Billing context snapshot for the INITIAL provider's losing attempt, captured BEFORE
+   * commitWinner overwrites the shared session's model/context with the winner's. Null for
+   * shadow-session attempts (which read their own un-polluted session at billing time).
+   */
+  billingSnapshot: {
+    originalModel: string | null;
+    redirectedModel: string | null;
+    requestedServiceTier: string | null;
+    context1mApplied: boolean;
+    groupCostMultiplier: number;
+  } | null;
 };
 
 type ReactiveRectifierRetryState = {
   thinkingSignatureRetried: boolean;
   thinkingBudgetRetried: boolean;
+  thinkingEffortConflictRetried: boolean;
 };
+
+type ReactiveRectifierType =
+  | "thinking_signature_rectifier"
+  | "thinking_budget_rectifier"
+  | "thinking_effort_conflict_rectifier";
 
 type ReactiveRectifierResult =
   | { matched: false }
@@ -211,13 +251,13 @@ type ReactiveRectifierResult =
       matched: true;
       applied: false;
       reason: "already_retried" | "not_applicable";
-      rectifierType: "thinking_signature_rectifier" | "thinking_budget_rectifier";
+      rectifierType: ReactiveRectifierType;
       trigger: string;
     }
   | {
       matched: true;
       applied: true;
-      rectifierType: "thinking_signature_rectifier" | "thinking_budget_rectifier";
+      rectifierType: ReactiveRectifierType;
       trigger: string;
       requestDetailsBeforeRectify: ReturnType<typeof buildRequestDetails>;
     };
@@ -740,12 +780,143 @@ function buildRetryFailedChainEntry(
   };
 }
 
-function getReactiveRectifierDisplayName(
-  rectifierType: "thinking_signature_rectifier" | "thinking_budget_rectifier"
-): string {
-  return rectifierType === "thinking_signature_rectifier"
-    ? "Thinking signature rectifier"
-    : "Thinking budget rectifier";
+/** 整流器构造审计对象时可用的上下文（trigger 为该描述符 detect 的命中结果） */
+type ReactiveRectifierAuditContext<TTrigger extends string = string> = {
+  trigger: TTrigger;
+  provider: Provider;
+  attemptNumber: number;
+  retryAttemptNumber: number;
+};
+
+/**
+ * Reactive rectifier 描述符：上游 4xx 命中触发词后“整流请求体 + 同供应商重试一次”。
+ *
+ * 泛型让各描述符内部保持窄类型；成员声明为方法签名（参数双变检查），
+ * 注册表才能按基类型 ReactiveRectifierDescriptor 统一持有。
+ */
+type ReactiveRectifierDescriptor<
+  TTrigger extends string = string,
+  TRectified extends { applied: boolean } = { applied: boolean },
+> = {
+  /** special-setting type，同时作为返回给重试决策的 rectifierType */
+  type: ReactiveRectifierType;
+  /** 日志展示名 */
+  displayName: string;
+  /** 从上游错误文案检测触发词；未命中返回 null */
+  detect(errorMessage: string): TTrigger | null;
+  /** 系统设置开关（默认开启）。命中触发词但被禁用时整体按未命中处理，不回退到后续整流器 */
+  isEnabled(settings: SystemSettings): boolean;
+  /** “同供应商仅重试一次”状态读写 */
+  hasRetried(state: ReactiveRectifierRetryState): boolean;
+  markRetried(state: ReactiveRectifierRetryState): void;
+  /** 原地整流请求体 */
+  rectify(message: Record<string, unknown>): TRectified;
+  /** 构造 special-setting 审计对象（payload 形状必须与历史实现保持一致） */
+  buildAuditSetting(
+    rectified: TRectified,
+    context: ReactiveRectifierAuditContext<TTrigger>
+  ): SpecialSetting;
+};
+
+const thinkingEffortConflictRectifierDescriptor: ReactiveRectifierDescriptor<
+  ThinkingEffortConflictRectifierTrigger,
+  ThinkingEffortConflictRectifierResult
+> = {
+  type: "thinking_effort_conflict_rectifier",
+  displayName: "Thinking effort conflict rectifier",
+  detect: detectThinkingEffortConflictRectifierTrigger,
+  isEnabled: (settings) => settings.enableThinkingEffortConflictRectifier ?? true,
+  hasRetried: (state) => state.thinkingEffortConflictRetried,
+  markRetried: (state) => {
+    state.thinkingEffortConflictRetried = true;
+  },
+  rectify: rectifyThinkingEffortConflict,
+  buildAuditSetting: (rectified, context) => ({
+    type: "thinking_effort_conflict_rectifier",
+    scope: "request",
+    hit: rectified.applied,
+    providerId: context.provider.id,
+    providerName: context.provider.name,
+    trigger: context.trigger,
+    attemptNumber: context.attemptNumber,
+    retryAttemptNumber: context.retryAttemptNumber,
+    removedOutputConfigEffort: rectified.removedOutputConfigEffort,
+    removedReasoningEffort: rectified.removedReasoningEffort,
+    thinkingType: rectified.thinkingType,
+    effort: rectified.effort,
+  }),
+};
+
+const thinkingSignatureRectifierDescriptor: ReactiveRectifierDescriptor<
+  ThinkingSignatureRectifierTrigger,
+  ThinkingSignatureRectifierResult
+> = {
+  type: "thinking_signature_rectifier",
+  displayName: "Thinking signature rectifier",
+  detect: detectThinkingSignatureRectifierTrigger,
+  isEnabled: (settings) => settings.enableThinkingSignatureRectifier ?? true,
+  hasRetried: (state) => state.thinkingSignatureRetried,
+  markRetried: (state) => {
+    state.thinkingSignatureRetried = true;
+  },
+  rectify: rectifyAnthropicRequestMessage,
+  buildAuditSetting: (rectified, context) => ({
+    type: "thinking_signature_rectifier",
+    scope: "request",
+    hit: rectified.applied,
+    providerId: context.provider.id,
+    providerName: context.provider.name,
+    trigger: context.trigger,
+    attemptNumber: context.attemptNumber,
+    retryAttemptNumber: context.retryAttemptNumber,
+    removedThinkingBlocks: rectified.removedThinkingBlocks,
+    removedRedactedThinkingBlocks: rectified.removedRedactedThinkingBlocks,
+    removedSignatureFields: rectified.removedSignatureFields,
+  }),
+};
+
+const thinkingBudgetRectifierDescriptor: ReactiveRectifierDescriptor<
+  ThinkingBudgetRectifierTrigger,
+  ThinkingBudgetRectifierResult
+> = {
+  type: "thinking_budget_rectifier",
+  displayName: "Thinking budget rectifier",
+  detect: detectThinkingBudgetRectifierTrigger,
+  isEnabled: (settings) => settings.enableThinkingBudgetRectifier ?? true,
+  hasRetried: (state) => state.thinkingBudgetRetried,
+  markRetried: (state) => {
+    state.thinkingBudgetRetried = true;
+  },
+  rectify: rectifyThinkingBudget,
+  buildAuditSetting: (rectified, context) => ({
+    type: "thinking_budget_rectifier",
+    scope: "request",
+    hit: rectified.applied,
+    providerId: context.provider.id,
+    providerName: context.provider.name,
+    trigger: context.trigger,
+    attemptNumber: context.attemptNumber,
+    retryAttemptNumber: context.retryAttemptNumber,
+    before: rectified.before,
+    after: rectified.after,
+  }),
+};
+
+// 注册表顺序即检测优先级：effort 冲突的错误文案更具体（reasoning_effort/output_config），
+// 必须先于签名整流器检测，避免被签名整流器的通用 invalid request 兜底吞掉。
+const REACTIVE_ANTHROPIC_RECTIFIERS: readonly ReactiveRectifierDescriptor[] = [
+  thinkingEffortConflictRectifierDescriptor,
+  thinkingSignatureRectifierDescriptor,
+  thinkingBudgetRectifierDescriptor,
+];
+
+function getReactiveRectifierDisplayName(rectifierType: ReactiveRectifierType): string {
+  for (const descriptor of REACTIVE_ANTHROPIC_RECTIFIERS) {
+    if (descriptor.type === rectifierType) {
+      return descriptor.displayName;
+    }
+  }
+  return rectifierType;
 }
 
 async function tryApplyReactiveAnthropicRectifier(params: {
@@ -772,43 +943,41 @@ async function tryApplyReactiveAnthropicRectifier(params: {
     return { matched: false };
   }
 
-  const signatureTrigger = detectThinkingSignatureRectifierTrigger(errorMessage);
-  if (signatureTrigger) {
-    const settings = await getCachedSystemSettings();
-    const enabled = settings.enableThinkingSignatureRectifier ?? true;
+  for (const descriptor of REACTIVE_ANTHROPIC_RECTIFIERS) {
+    const trigger = descriptor.detect(errorMessage);
+    if (!trigger) {
+      continue;
+    }
 
-    if (!enabled) {
+    // 命中触发词后即终结（后续分支不再检测），与历史的 if/else 级联保持一致
+    const settings = await getCachedSystemSettings();
+    if (!descriptor.isEnabled(settings)) {
       return { matched: false };
     }
 
-    if (params.retryState.thinkingSignatureRetried) {
+    if (descriptor.hasRetried(params.retryState)) {
       return {
         matched: true,
         applied: false,
         reason: "already_retried",
-        rectifierType: "thinking_signature_rectifier",
-        trigger: signatureTrigger,
+        rectifierType: descriptor.type,
+        trigger,
       };
     }
 
     const requestDetailsBeforeRectify = buildRequestDetails(requestSession);
-    const rectified = rectifyAnthropicRequestMessage(
-      requestSession.request.message as Record<string, unknown>
-    );
+    const rectified = descriptor.rectify(requestSession.request.message as Record<string, unknown>);
 
-    addSpecialSettingForPersistence(requestSession, persistSession, {
-      type: "thinking_signature_rectifier",
-      scope: "request",
-      hit: rectified.applied,
-      providerId: provider.id,
-      providerName: provider.name,
-      trigger: signatureTrigger,
-      attemptNumber,
-      retryAttemptNumber,
-      removedThinkingBlocks: rectified.removedThinkingBlocks,
-      removedRedactedThinkingBlocks: rectified.removedRedactedThinkingBlocks,
-      removedSignatureFields: rectified.removedSignatureFields,
-    });
+    addSpecialSettingForPersistence(
+      requestSession,
+      persistSession,
+      descriptor.buildAuditSetting(rectified, {
+        trigger,
+        provider,
+        attemptNumber,
+        retryAttemptNumber,
+      })
+    );
     await persistSpecialSettings(persistSession);
 
     if (!rectified.applied) {
@@ -816,80 +985,22 @@ async function tryApplyReactiveAnthropicRectifier(params: {
         matched: true,
         applied: false,
         reason: "not_applicable",
-        rectifierType: "thinking_signature_rectifier",
-        trigger: signatureTrigger,
+        rectifierType: descriptor.type,
+        trigger,
       };
     }
 
-    params.retryState.thinkingSignatureRetried = true;
+    descriptor.markRetried(params.retryState);
     return {
       matched: true,
       applied: true,
-      rectifierType: "thinking_signature_rectifier",
-      trigger: signatureTrigger,
+      rectifierType: descriptor.type,
+      trigger,
       requestDetailsBeforeRectify,
     };
   }
 
-  const budgetTrigger = detectThinkingBudgetRectifierTrigger(errorMessage);
-  if (!budgetTrigger) {
-    return { matched: false };
-  }
-
-  const settings = await getCachedSystemSettings();
-  const enabled = settings.enableThinkingBudgetRectifier ?? true;
-
-  if (!enabled) {
-    return { matched: false };
-  }
-
-  if (params.retryState.thinkingBudgetRetried) {
-    return {
-      matched: true,
-      applied: false,
-      reason: "already_retried",
-      rectifierType: "thinking_budget_rectifier",
-      trigger: budgetTrigger,
-    };
-  }
-
-  const requestDetailsBeforeRectify = buildRequestDetails(requestSession);
-  const rectified = rectifyThinkingBudget(
-    requestSession.request.message as Record<string, unknown>
-  );
-
-  addSpecialSettingForPersistence(requestSession, persistSession, {
-    type: "thinking_budget_rectifier",
-    scope: "request",
-    hit: rectified.applied,
-    providerId: provider.id,
-    providerName: provider.name,
-    trigger: budgetTrigger,
-    attemptNumber,
-    retryAttemptNumber,
-    before: rectified.before,
-    after: rectified.after,
-  });
-  await persistSpecialSettings(persistSession);
-
-  if (!rectified.applied) {
-    return {
-      matched: true,
-      applied: false,
-      reason: "not_applicable",
-      rectifierType: "thinking_budget_rectifier",
-      trigger: budgetTrigger,
-    };
-  }
-
-  params.retryState.thinkingBudgetRetried = true;
-  return {
-    matched: true,
-    applied: true,
-    rectifierType: "thinking_budget_rectifier",
-    trigger: budgetTrigger,
-    requestDetailsBeforeRectify,
-  };
+  return { matched: false };
 }
 
 /**
@@ -1072,6 +1183,7 @@ export class ProxyForwarder {
       const reactiveRectifierRetryState: ReactiveRectifierRetryState = {
         thinkingSignatureRetried: false,
         thinkingBudgetRetried: false,
+        thinkingEffortConflictRetried: false,
       };
 
       const requestPath = session.requestUrl.pathname;
@@ -3620,10 +3732,13 @@ export class ProxyForwarder {
     }
 
     const rawCrossProviderFallbackEnabled = session.isRawCrossProviderFallbackEnabled();
+    // 竞速输家计费开关：开启时落败供应商不被直接掐断，而是后台 drain 并计费。
+    const billHedgeLosers = (await getCachedSystemSettings()).billHedgeLosers === true;
     const launchedProviderIds = new Set<number>();
     let launchedProviderCount = 0;
     let settled = false;
     let winnerCommitted = false;
+    let winnerAttempt: StreamingHedgeAttempt | null = null;
     let noMoreProviders = false;
     let launchingAlternative: Promise<void> | null = null;
     let lastError: Error | null = null;
@@ -3679,6 +3794,110 @@ export class ProxyForwarder {
       }
     };
 
+    // 后台 drain 一个落败供应商的响应体以拿回 token 用量并计费。
+    // 不取消连接：读到流自然结束（或超时/容量上限）后，复用赢家相同的计费链，
+    // 把费用异步累加回原请求行。幂等（loserBillingStarted 守卫），失败静默。
+    const startLoserBilling = (attempt: StreamingHedgeAttempt) => {
+      if (attempt.loserBillingStarted) return;
+      attempt.loserBillingStarted = true;
+
+      const reader = attempt.reader;
+      const response = attempt.response;
+      const messageRequestId = session.messageContext?.id;
+      if (!reader || !response || messageRequestId == null) {
+        // 无可读响应或无请求行可归属 -> 无法计费，直接释放资源。
+        const cancel = reader?.cancel("hedge_loser_no_billing");
+        cancel?.catch(() => undefined);
+        releaseAttemptAgent(attempt);
+        return;
+      }
+
+      const controller = attempt.responseController;
+      const drainTimeoutMs = getEnvConfig().HEDGE_LOSER_DRAIN_TIMEOUT_MS;
+      const drainTimer = setTimeout(() => {
+        try {
+          controller?.abort(new Error("hedge_loser_drain_timeout"));
+        } catch {
+          /* ignore */
+        }
+      }, drainTimeoutMs);
+
+      void (async () => {
+        const decoder = new TextDecoder();
+        const chunks: string[] = [];
+        let totalBytes = 0;
+        let drainComplete = false;
+        const MAX_DRAIN_BYTES = 32 * 1024 * 1024;
+        // 若落败前已读走首块（赢家先提交导致），先补回，避免丢失 message_start 的 usage。
+        if (attempt.firstChunk) {
+          chunks.push(decoder.decode(attempt.firstChunk, { stream: true }));
+          totalBytes += attempt.firstChunk.byteLength;
+          attempt.firstChunk = null;
+        }
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              drainComplete = true;
+              break;
+            }
+            if (value) {
+              chunks.push(decoder.decode(value, { stream: true }));
+              totalBytes += value.byteLength;
+              if (totalBytes > MAX_DRAIN_BYTES) {
+                logger.warn("ProxyForwarder: hedge loser drain exceeded cap, skipping bill", {
+                  sessionId: attempt.session.sessionId ?? null,
+                  providerId: attempt.provider.id,
+                  providerName: attempt.provider.name,
+                  totalBytes,
+                });
+                try {
+                  controller?.abort(new Error("hedge_loser_drain_cap"));
+                } catch {
+                  /* ignore */
+                }
+                break;
+              }
+            }
+          }
+        } catch (drainError) {
+          // 中止 / 网络错误：drain 未自然结束，drainComplete 保持 false（避免按 per-request fee 多计）。
+          logger.debug("ProxyForwarder: hedge loser drain ended early", {
+            error: drainError instanceof Error ? drainError.message : String(drainError),
+            sessionId: attempt.session.sessionId ?? null,
+            providerId: attempt.provider.id,
+            providerName: attempt.provider.name,
+          });
+        }
+        const flushed = decoder.decode();
+        if (flushed) chunks.push(flushed);
+        const allContent = chunks.join("");
+
+        await finalizeHedgeLoserBilling({
+          messageRequestId,
+          loserSession: attempt.session,
+          provider: attempt.provider,
+          attemptNumber: attempt.sequence,
+          upstreamStatusCode: response.status,
+          allContent,
+          drainComplete,
+          billingContext: attempt.billingSnapshot ?? undefined,
+        });
+      })()
+        .catch((billingError) => {
+          logger.debug("ProxyForwarder: hedge loser billing task failed", {
+            error: billingError instanceof Error ? billingError.message : String(billingError),
+            sessionId: attempt.session.sessionId ?? null,
+            providerId: attempt.provider.id,
+            providerName: attempt.provider.name,
+          });
+        })
+        .finally(() => {
+          clearTimeout(drainTimer);
+          releaseAttemptAgent(attempt);
+        });
+    };
+
     const abortAttempt = (attempt: StreamingHedgeAttempt, reason: string) => {
       if (attempt.settled) return;
       attempt.settled = true;
@@ -3687,6 +3906,24 @@ export class ProxyForwarder {
         attempt.thresholdTimer = null;
       }
       attempts.delete(attempt);
+
+      // 竞速输家计费开启：仅标记 + 记录决策链，不取消连接、不释放 agent。
+      // 实际的后台 drain 由 runAttempt 的 .then 流程发起（它独占 reader，避免并发读）。
+      if (reason === "hedge_loser" && attempt.billAsLoser) {
+        session.addProviderToChain(attempt.provider, {
+          ...attempt.endpointAudit,
+          reason: "hedge_loser_billed",
+          attemptNumber: attempt.sequence,
+          statusCode: attempt.response?.status,
+          modelRedirect: getAttemptModelRedirect(attempt),
+        });
+        ProxyForwarder.markProviderFailed(session, failedProviderIds, attempt.provider.id);
+        return;
+      }
+
+      // 因非竞速原因（client_abort / launch_failed 等）被取消：禁止后台计费，正常取消连接。
+      attempt.billAsLoser = false;
+
       if (reason === "hedge_loser") {
         session.addProviderToChain(attempt.provider, {
           ...attempt.endpointAudit,
@@ -3823,6 +4060,20 @@ export class ProxyForwarder {
           if (settled || winnerCommitted || attempt.settled) {
             const attemptRuntime = attempt.session as ProxySessionWithAttemptRuntime;
             attempt.releaseAgent = attemptRuntime.releaseAgent ?? attempt.releaseAgent;
+
+            // 竞速输家计费：保活该响应并后台 drain 计费，而非取消。
+            if (attempt.billAsLoser && !attempt.loserBillingStarted && response.body) {
+              attempt.responseController =
+                attemptRuntime.responseController ?? attempt.responseController;
+              attempt.clearResponseTimeout =
+                attemptRuntime.clearResponseTimeout ?? attempt.clearResponseTimeout;
+              attempt.clearResponseTimeout?.();
+              attempt.response = response;
+              attempt.reader = response.body.getReader();
+              startLoserBilling(attempt);
+              return;
+            }
+
             try {
               attemptRuntime.responseController?.abort(new Error("hedge_loser"));
             } catch (abortError) {
@@ -3873,25 +4124,53 @@ export class ProxyForwarder {
               return;
             }
 
+            // 保留首块：若本 attempt 落败且需要计费，drain 时需要补回首块的 usage。
+            attempt.firstChunk = firstChunk.value;
             await commitWinner(attempt, firstChunk.value);
+
+            // 本 attempt 读到首块却落败（winner 已先提交，commitWinner 早退）：
+            // 若开启输家计费且本 attempt 不是赢家，在此发起后台 drain（此时已无并发读）。
+            if (
+              attempt !== winnerAttempt &&
+              attempt.billAsLoser &&
+              attempt.settled &&
+              !attempt.loserBillingStarted &&
+              attempt.response &&
+              attempt.reader
+            ) {
+              startLoserBilling(attempt);
+            }
           } catch (firstChunkError) {
             const normalizedError =
               firstChunkError instanceof Error
                 ? firstChunkError
                 : new Error(String(firstChunkError));
-            if (settled || winnerCommitted) return;
+            // 不提前 return：handleAttemptFailure 的首个守卫会兜底清理“已结算的计费输家”
+            // （否则赢家已提交时这里 return 会泄漏其 reader/agent）。
             await handleAttemptFailure(attempt, normalizedError);
           }
         })
         .catch(async (attemptError) => {
           const normalizedError =
             attemptError instanceof Error ? attemptError : new Error(String(attemptError));
-          if (settled || winnerCommitted) return;
           await handleAttemptFailure(attempt, normalizedError);
         });
     };
 
     const handleAttemptFailure = async (attempt: StreamingHedgeAttempt, error: Error) => {
+      // 已被标记为计费输家、billing 尚未启动、却在此失败（如首块读取出错 / 赢家已提交）：
+      // 此时 abortAttempt 已早退（未取消连接/未释放 agent），由这里兜底清理，避免 reader/agent 泄漏。
+      if (
+        attempt !== winnerAttempt &&
+        attempt.settled &&
+        attempt.billAsLoser &&
+        !attempt.loserBillingStarted
+      ) {
+        const readerCancel = attempt.reader?.cancel("hedge_loser_failed");
+        readerCancel?.catch(() => undefined);
+        releaseAttemptAgent(attempt);
+        return;
+      }
       if (settled || winnerCommitted || attempt.settled) return;
 
       lastError = error;
@@ -4076,6 +4355,7 @@ export class ProxyForwarder {
         return;
 
       winnerCommitted = true;
+      winnerAttempt = attempt;
 
       if (attempt.thresholdTimer) {
         clearTimeout(attempt.thresholdTimer);
@@ -4090,6 +4370,22 @@ export class ProxyForwarder {
       }
 
       if (attempt.session !== session) {
+        // The winner is an alternative; syncWinningAttemptSession is about to overwrite the
+        // ORIGINAL session's model/context with the winner's. Snapshot the initial-provider
+        // loser's own billing context FIRST so it is priced against its own model, not the winner's.
+        for (const other of attempts) {
+          if (other !== attempt && other.session === session && other.billAsLoser) {
+            const loserRequest = session.request.message as Record<string, unknown>;
+            other.billingSnapshot = {
+              originalModel: session.getOriginalModel(),
+              redirectedModel: session.getCurrentModel(),
+              requestedServiceTier:
+                typeof loserRequest.service_tier === "string" ? loserRequest.service_tier : null,
+              context1mApplied: session.getContext1mApplied(),
+              groupCostMultiplier: session.getGroupCostMultiplier(),
+            };
+          }
+        }
         ProxyForwarder.syncWinningAttemptSession(session, attempt.session);
       }
       const detailSnapshotSession = attempt.session as ProxySessionWithDetailSnapshotRuntime;
@@ -4123,7 +4419,9 @@ export class ProxyForwarder {
             attempt.provider.priority || 0,
             launchedProviderCount === 1 && attempt.provider.id === initialProvider.id,
             attempt.provider.id !== initialProvider.id,
-            session.authState?.key?.id ?? null
+            session.authState?.key?.id ?? null,
+            // 产生了真实竞速赢家时，无条件把 Session 复用绑定改绑到赢家。
+            isActualHedgeWin
           );
 
           if (bindingResult.updated) {
@@ -4161,6 +4459,7 @@ export class ProxyForwarder {
         endpointUrl: attempt.endpointAudit.endpointUrl,
         upstreamStatusCode: attempt.response.status,
         isHedgeWinner: isActualHedgeWin,
+        billHedgeLosers,
       });
 
       const response = new Response(
@@ -4248,6 +4547,7 @@ export class ProxyForwarder {
         reactiveRectifierRetryState: {
           thinkingSignatureRetried: false,
           thinkingBudgetRetried: false,
+          thinkingEffortConflictRetried: false,
         },
         settled: false,
         thresholdTriggered: false,
@@ -4256,6 +4556,12 @@ export class ProxyForwarder {
         response: null,
         releaseAgent: null,
         agentReleased: false,
+        // Only keep a loser alive for billing if there is a request row to bill back to;
+        // otherwise cancel it normally (no point holding the connection).
+        billAsLoser: billHedgeLosers && session.messageContext?.id != null,
+        loserBillingStarted: false,
+        firstChunk: null,
+        billingSnapshot: null,
       };
 
       attempts.add(attempt);

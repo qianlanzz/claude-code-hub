@@ -251,6 +251,7 @@ export function toSystemSettings(dbSettings: any): SystemSettings {
         ? dbSettings.codexPriorityBillingSource
         : "requested",
     billNonSuccessfulRequests: dbSettings?.billNonSuccessfulRequests ?? false,
+    billHedgeLosers: dbSettings?.billHedgeLosers ?? true,
     timezone: dbSettings?.timezone ?? null,
     enableAutoCleanup: dbSettings?.enableAutoCleanup ?? false,
     cleanupRetentionDays: dbSettings?.cleanupRetentionDays ?? 30,
@@ -265,6 +266,8 @@ export function toSystemSettings(dbSettings: any): SystemSettings {
     interceptAnthropicWarmupRequests: dbSettings?.interceptAnthropicWarmupRequests ?? false,
     enableThinkingSignatureRectifier: dbSettings?.enableThinkingSignatureRectifier ?? true,
     enableThinkingBudgetRectifier: dbSettings?.enableThinkingBudgetRectifier ?? true,
+    enableThinkingEffortConflictRectifier:
+      dbSettings?.enableThinkingEffortConflictRectifier ?? true,
     enableBillingHeaderRectifier: dbSettings?.enableBillingHeaderRectifier ?? true,
     enableResponseInputRectifier: dbSettings?.enableResponseInputRectifier ?? true,
     allowNonConversationEndpointProviderFallback:

@@ -61,7 +61,12 @@ export function getAvailableProviderGroups(userId?: number): Promise<string[]> {
 }
 
 export function getProviderGroupsWithCount() {
-  return apiGet(`/api/v1/providers/groups?include=count`, dashboardCompatOptions);
+  return toActionResult(
+    apiGet<Array<{ group: string; providerCount: number }>>(
+      `/api/v1/providers/groups?include=count`,
+      dashboardCompatOptions
+    )
+  );
 }
 
 export function addProvider(data: unknown) {
@@ -199,6 +204,12 @@ export function testProviderUnified(data: unknown) {
   return toActionResult(apiPost("/api/v1/providers/test:unified", data, dashboardCompatOptions));
 }
 
+export function testProviderById(providerId: number, data?: { model?: string }) {
+  return toActionResult(
+    apiPost(`/api/v1/providers/${providerId}/test`, data ?? {}, dashboardCompatOptions)
+  );
+}
+
 export function getProviderTestPresets(providerType: string) {
   return toActionResult(
     apiGet(
@@ -219,9 +230,11 @@ export function fetchUpstreamModels(data: unknown) {
 }
 
 export function getModelSuggestionsByProviderGroup(providerGroup?: string | null) {
-  return apiGet(
-    `/api/v1/providers/model-suggestions${searchParams({ providerGroup })}`,
-    dashboardCompatOptions
+  return toActionResult(
+    apiGet<string[]>(
+      `/api/v1/providers/model-suggestions${searchParams({ providerGroup })}`,
+      dashboardCompatOptions
+    )
   );
 }
 

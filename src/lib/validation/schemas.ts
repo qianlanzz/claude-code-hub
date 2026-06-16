@@ -993,6 +993,8 @@ export const UpdateSystemSettingsSchema = z.object({
   enableHttp2: z.boolean().optional(),
   // 非成功请求按 token 用量计费（可选；默认关闭）
   billNonSuccessfulRequests: z.boolean().optional(),
+  // 供应商竞速输家计费（可选；默认开启）
+  billHedgeLosers: z.boolean().optional(),
   // 启用 OpenAI Responses WebSocket 支持（可选，仅 Codex 类型供应商生效）
   enableOpenaiResponsesWebsocket: z.boolean().optional(),
   // 高并发模式（可选）
@@ -1003,6 +1005,8 @@ export const UpdateSystemSettingsSchema = z.object({
   enableThinkingSignatureRectifier: z.boolean().optional(),
   // thinking budget 整流器（可选）
   enableThinkingBudgetRectifier: z.boolean().optional(),
+  // thinking effort 冲突整流器（可选）
+  enableThinkingEffortConflictRectifier: z.boolean().optional(),
   // billing header 整流器（可选）
   enableBillingHeaderRectifier: z.boolean().optional(),
   // Response API input 整流器（可选）

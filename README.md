@@ -22,6 +22,11 @@ Claude Code Hub 通过 Next.js 15 + Hono + PostgreSQL + Redis 组合，实现 Cl
 
 ---
 
+> [!IMPORTANT]
+> **当前项目正处于积极重构阶段**
+>
+> Claude Code Hub 的重构版本 Claude Code Hub Plus 预计将于第三季度以 AGPL 形式开源。Claude Code Hub Plus 致力于打造高性能、稳定的商用级 LLM 网关，提供格式转换、隐私过滤、模型广场、充值计费等完善的商用功能，并显著提升转发核心的理论性能。重构版本开发期间，Node.js 版本的开发进度和社区支持可能延误，敬请理解。
+
 <table>
 <tr>
 <td width="200">
@@ -81,22 +86,6 @@ AIGoCode 为 CCH 的用户提供了特别福利，通过此链接注册的用户
 <table>
 <tr>
 <td width="200">
-<a href="https://www.aicodemirror.com/register?invitecode=ZRQVL9">
-<img src="public/readme/aicodemirror.jpg" alt="AICodeMirror Logo" width="180"/>
-</a>
-</td>
-<td>
-<b>💎 特别优惠</b>：感谢 <a href="https://www.aicodemirror.com/register?invitecode=ZRQVL9">AICodeMirror</a> 对本项目的赞助！AICodeMirror 提供 Claude Code / Codex / Gemini CLI 官方高稳定性中转服务，支持企业级并发、快速开票、7×24 小时专属技术支持。<br/>
-Claude Code / Codex / Gemini 官方渠道价格低至原价的 38% / 6% / 9%，充值还有额外折扣！<br/>
-针对 claude-code-hub 用户，AICodeMirror 特别推出福利：通过下方链接注册，首充立享 8 折 优惠；企业客户更可享受最高 7.5 折 折上折。<br/>
-通过此链接注册即可享受优惠 → <a href="https://www.aicodemirror.com/register?invitecode=ZRQVL9">立即访问</a>
-</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="200">
 <a href="https://pateway.ai/?ch=1ycdoum&aff=T8FV5H42">
 <img src="public/readme/pateway.png" alt="PatewayAI Logo" width="180"/>
 </a>
@@ -125,7 +114,7 @@ Claude Code / Codex / Gemini 官方渠道价格低至原价的 38% / 6% / 9%，�
 ### 环境要求
 
 - Docker 与 Docker Compose（推荐使用最新版本）
-- 可选（本地开发）：Node.js ≥ 20，Bun ≥ 1.3
+- 可选（本地开发）：Node.js ≥ 22.15（入站请求体 zstd 解压依赖原生 `node:zlib` zstd），Bun ≥ 1.3
 
 ### 🚀 一键部署脚本（✨ 推荐方式，全自动安装）
 

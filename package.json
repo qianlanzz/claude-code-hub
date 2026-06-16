@@ -2,6 +2,9 @@
   "name": "claude-code-hub",
   "version": "0.8.0",
   "private": true,
+  "engines": {
+    "node": ">=22.15.0"
+  },
   "scripts": {
     "dev": "tsgo -p tsconfig.json --noEmit && next dev --port 13500",
     "dev:server": "NODE_ENV=development node server.js",
@@ -21,6 +24,7 @@
     "test:coverage:logs-sessionid-time-filter": "vitest run --config tests/configs/logs-sessionid-time-filter.config.ts --coverage",
     "test:coverage:codex-session-id-completer": "vitest run --config tests/configs/codex-session-id-completer.config.ts --coverage",
     "test:coverage:thinking-signature-rectifier": "vitest run --config tests/configs/thinking-signature-rectifier.config.ts --coverage",
+    "test:coverage:thinking-effort-conflict-rectifier": "vitest run --config tests/configs/thinking-effort-conflict-rectifier.config.ts --coverage",
     "test:coverage:quota": "vitest run --config tests/configs/quota.config.ts --coverage",
     "test:coverage:my-usage": "vitest run --config tests/configs/my-usage.config.ts --coverage",
     "test:coverage:proxy-guard-pipeline": "vitest run --config tests/configs/proxy-guard-pipeline.config.ts --coverage",
@@ -89,6 +93,7 @@
     "dotenv": "^17",
     "drizzle-orm": "^0.45",
     "fetch-socks": "^1",
+    "fflate": "^0.8.2",
     "framer-motion": "^12",
     "hono": "^4",
     "html2canvas": "^1",
@@ -122,6 +127,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2",
     "@tailwindcss/postcss": "^4.2.0",
+    "@types/geojson": "^7946.0.16",
     "@types/ioredis": "^5",
     "@types/node": "^25",
     "@types/pg": "^8",

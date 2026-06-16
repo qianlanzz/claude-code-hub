@@ -58,6 +58,7 @@ export async function saveSystemSettings(formData: {
   billingModelSource?: string;
   codexPriorityBillingSource?: CodexPriorityBillingSource;
   billNonSuccessfulRequests?: boolean;
+  billHedgeLosers?: boolean;
   timezone?: string | null;
   enableAutoCleanup?: boolean;
   cleanupRetentionDays?: number;
@@ -72,6 +73,7 @@ export async function saveSystemSettings(formData: {
   interceptAnthropicWarmupRequests?: boolean;
   enableThinkingSignatureRectifier?: boolean;
   enableThinkingBudgetRectifier?: boolean;
+  enableThinkingEffortConflictRectifier?: boolean;
   enableBillingHeaderRectifier?: boolean;
   enableResponseInputRectifier?: boolean;
   allowNonConversationEndpointProviderFallback?: boolean;
@@ -109,6 +111,7 @@ export async function saveSystemSettings(formData: {
       billingModelSource: validated.billingModelSource,
       codexPriorityBillingSource: validated.codexPriorityBillingSource,
       billNonSuccessfulRequests: validated.billNonSuccessfulRequests,
+      billHedgeLosers: validated.billHedgeLosers,
       timezone: validated.timezone,
       enableAutoCleanup: validated.enableAutoCleanup,
       cleanupRetentionDays: validated.cleanupRetentionDays,
@@ -123,6 +126,7 @@ export async function saveSystemSettings(formData: {
       interceptAnthropicWarmupRequests: validated.interceptAnthropicWarmupRequests,
       enableThinkingSignatureRectifier: validated.enableThinkingSignatureRectifier,
       enableThinkingBudgetRectifier: validated.enableThinkingBudgetRectifier,
+      enableThinkingEffortConflictRectifier: validated.enableThinkingEffortConflictRectifier,
       enableBillingHeaderRectifier: validated.enableBillingHeaderRectifier,
       enableResponseInputRectifier: validated.enableResponseInputRectifier,
       allowNonConversationEndpointProviderFallback:
